@@ -1,1 +1,1 @@
-# Uses only Python standard library
+Pillow>=10.0,<13

@@ -48,3 +48,7 @@ Telegram-first daily training coach for the 12-week lean swimmer physique progra
 
 ## Routing fix (11 Nov 2026)
 This version uses explicit Vercel rewrites to `api/index.py?route=...` and dispatches by the route query parameter. Redeploy with the repository root containing `api/` and `vercel.json`. Test `/api/health` after deployment.
+
+
+## v5
+See `UPGRADE_V5.md` for combined v4 + lap analytics deployment. `/swimdetail` fetches and caches latest Strava swim lap pace and heart rate.

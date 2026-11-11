@@ -1,4 +1,4 @@
-import os, json, datetime, urllib.request, urllib.parse, urllib.error, hmac, hashlib, secrets, time, re
+import os, json, datetime, urllib.request, urllib.parse, urllib.error, hmac, hashlib, secrets, time, re, io, statistics
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlsplit, parse_qs
@@ -106,6 +106,61 @@ def sync_strava():
             imported+=1
     return {'imported':imported,'recognized':seen,'updated':updated,'swims':swims}
 
+
+# V5: on-demand lap-level Strava analytics. Fetch once, cache in Supabase.
+# Strava laps are not guaranteed to correspond to pool lengths or written sets.
+def pace_per_100(seconds, metres):
+    if not seconds or not metres or metres<=0:return None
+    pace=round(float(seconds)*100/float(metres))
+    return f'{pace//60}:{pace%60:02d}/100m'
+
+def swim_lap_analysis(activity_id, token):
+    laps=strava_api('/api/v3/activities/'+urllib.parse.quote(str(activity_id),safe='')+'/laps',token)
+    if not isinstance(laps,list):return {'laps':[], 'message':'No lap data returned by Strava.'}
+    results=[]
+    for idx,lap in enumerate(laps[:250],1):
+        distance=lap.get('distance') or 0
+        duration=lap.get('moving_time') or lap.get('elapsed_time') or 0
+        hr=lap.get('average_heartrate')
+        results.append({'lap':idx,'name':str(lap.get('name') or '')[:100], 'distance_m':round(distance,1),
+            'duration_s':duration,'pace_100m':pace_per_100(duration,distance),
+            'average_heartrate':round(hr) if isinstance(hr,(int,float)) else None,
+            'max_heartrate':round(lap['max_heartrate']) if isinstance(lap.get('max_heartrate'),(int,float)) else None})
+    paces=[float(x['duration_s'])*100/x['distance_m'] for x in results if x['distance_m']>=25 and x['duration_s']]
+    hrs=[x['average_heartrate'] for x in results if x['average_heartrate'] is not None]
+    return {'laps':results,'lap_count':len(laps),'pace_range': [pace_per_100(min(paces),100),pace_per_100(max(paces),100)] if paces else None,
+            'hr_range':[min(hrs),max(hrs)] if hrs else None,
+            'message':'Strava lap boundaries may differ from your described sets. HR is shown only where provided.'}
+
+def swim_performance_report():
+    rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=1&select=activity_id,name,activity_date,distance_m,moving_time_s,average_heartrate,lap_analysis')
+    if not rows:return 'No swims imported. Send /sync first.'
+    r=rows[0]; report=r.get('lap_analysis')
+    if report is None:
+        token=strava_token()
+        if not token:return 'Strava is not connected. Send /connect.'
+        try:
+            report=swim_lap_analysis(r['activity_id'],token)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401,403):return 'Strava did not authorize lap access. Reconnect with /connect if necessary.'
+            if exc.code==404:return 'Strava does not expose lap details for this swim.'
+            print('Swim laps HTTP status',exc.code)
+            return 'Could not retrieve swim laps right now. Try again later.'
+        db('strava_imports','PATCH',{'lap_analysis':report},'?activity_id=eq.'+str(r['activity_id']))
+    total=r.get('distance_m') or 0
+    avg=pace_per_100(r.get('moving_time_s'),total)
+    hr=r.get('average_heartrate')
+    lines=[f"SWIM PERFORMANCE — {r['activity_date']}",str(r.get('name') or 'Swim'),
+           f"Distance: {total:g}m | Overall moving pace: {avg or 'unavailable'} | Avg HR: {round(hr) if isinstance(hr,(int,float)) else 'unavailable'} bpm",
+           f"Strava laps: {report.get('lap_count',0)}"]
+    laps=report.get('laps') or []
+    for lap in laps[:15]:
+        lines.append(f"{lap['lap']:>2}. {lap['distance_m']:g}m · {lap['pace_100m'] or 'pace n/a'} · HR {lap['average_heartrate'] if lap['average_heartrate'] is not None else 'n/a'} bpm")
+    if len(laps)>15:lines.append(f'… plus {len(laps)-15} more laps (showing first 15).')
+    if not laps:lines.append('No lap-level data available for this swim.')
+    lines.append('Note: pool lap boundaries and written intervals may differ; HR is not always available or reliable in water.')
+    return '\n'.join(lines)
+
 def swim_report():
     rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=5&select=name,activity_date,distance_m,swim_analysis')
     if not rows:return 'No imported swims yet. Send /sync first.'
@@ -190,6 +245,9 @@ def recommend(date):
         if ctx['gym']>=2:
             adjustment='Two gym sessions already recorded this week. Consider mobility or an easy recovery session instead.'
         reasons.append(f'{ctx["gym"]} / 2 gym sessions logged this week.')
+    safety=recovery_guidance(date,kind)
+    if safety:
+        adjustment=safety['adjustment'];reasons.extend(safety['reasons'])
     if not knee:reasons.append('No knee pain score logged yet; use /knee 0–10 to improve safety checks.')
     elif age is not None and age>3:reasons.append(f'Last knee score is {age} days old; log an updated score if symptoms changed.')
     return {'week':week,'name':name,'kind':kind,'details':details,'restriction':restriction,'adjustment':adjustment,'reasons':reasons,'context':ctx}
@@ -220,7 +278,9 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+    extra=handle_v4(text,chat_id,cmd,parts)
+    if extra is not None:return extra
     if cmd=='/today': return message_today(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/plan':
@@ -239,6 +299,8 @@ def handle(text,chat_id):
             return 'Strava sync failed. Check Vercel logs and Strava configuration.'
     if cmd=='/swims':
         return swim_report()
+    if cmd in ('/swimdetail','/laps'):
+        return swim_performance_report()
     if cmd=='/weight':
         if len(parts)!=2: return 'Usage: /weight 74.8'
         try: value=float(parts[1]); assert 35<=value<=250
@@ -266,7 +328,180 @@ def handle(text,chat_id):
         swim=sum((r.get('distance_m') or 0) for r in rows if r['kind']=='swim')
         gym=sum(1 for r in rows if r['kind']=='gym')
         return f'THIS WEEK\nSwim: {swim:,} / ~8,200 m\nGym: {gym} / 2 sessions\n\nBased on activities logged in Athlete OS. Strava activities are included after /sync or the daily scheduled import.'
-    return 'Unknown command. Try /help.'
+    return natural_recovery(text,chat_id) if not text.startswith('/') else 'Unknown command. Try /help.'
+
+
+# V4: no public access; all records remain private in service-role Supabase tables.
+def qchat(chat):return urllib.parse.quote(str(chat),safe='')
+def latest_checkin(date=None):
+    date=date or today()
+    rows=db('wellness_checkins',query='?chat_id=eq.'+qchat(env('TELEGRAM_CHAT_ID'))+'&logged_on=lte.'+date.isoformat()+'&order=logged_on.desc,created_at.desc&limit=1&select=*')
+    return rows[0] if rows else None
+
+def recovery_guidance(date,kind):
+    r=latest_checkin(date)
+    if not r:return None
+    age=(date-datetime.date.fromisoformat(r['logged_on'])).days
+    if age>2:return None
+    reasons=[]
+    if r.get('fatigue') is not None and r['fatigue']>=4:reasons.append('Recent fatigue '+str(r['fatigue'])+'/5.')
+    if r.get('sleep_hours') is not None and float(r['sleep_hours'])<6:reasons.append('Recent sleep under six hours.')
+    if r.get('knee_pain') is not None and r['knee_pain']>=3:reasons.append('Knee symptoms elevated ('+str(r['knee_pain'])+'/10).')
+    if r.get('achilles_pain') is not None and r['achilles_pain']>=3:reasons.append('Achilles symptoms elevated ('+str(r['achilles_pain'])+'/10).')
+    if r.get('injury_note'):reasons.append('An injury/symptom report was logged; do not increase impact loading without assessment.')
+    if reasons:return {'adjustment':'Prioritize rest or easy symptom-tolerated movement today. Avoid intensity or impact progression; seek clinical advice for new or worsening symptoms.','reasons':reasons}
+    return None
+
+def log_checkin(chat,values):
+    payload={'chat_id':str(chat),'logged_on':today().isoformat(),**values}
+    db('wellness_checkins','POST',payload)
+    return 'Recovery check-in saved. /coach will consider this report. For new, severe, worsening or persistent symptoms, consult a clinician; urgent symptoms need prompt medical care.'
+
+def natural_recovery(text,chat):
+    t=text.lower()
+    injury_words=('injur','hurt','pain','swollen','swelling','sprain','tendon','achilles','knee','limp','sore')
+    fatigue_words=('fatigue','exhaust','tired','poor sleep','slept','sleepy','drained')
+    if not any(w in t for w in injury_words+fatigue_words):return 'I can log fatigue, sleep or injury symptoms. Try /checkin fatigue 4 sleep 5 knee 2 achilles 1, or describe how you feel.'
+    values={'injury_note':text[:1000]}
+    m=re.search(r'(?:slept|sleep)\s*(?:for\s*)?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b',t)
+    if m:values['sleep_hours']=min(24,float(m.group(1)))
+    m=re.search(r'(?:fatigue|tiredness)\s*(?:is|:|=)?\s*(\d)\s*(?:/5)?',t)
+    if m and 1<=int(m.group(1))<=5:values['fatigue']=int(m.group(1))
+    for label,col in (('knee','knee_pain'),('achilles','achilles_pain')):
+        m=re.search(label+r'\s*(?:pain|is|:|=)?\s*(\d{1,2})\s*(?:/10)?',t)
+        if m and int(m.group(1))<=10:values[col]=int(m.group(1))
+    log_checkin(chat,values)
+    if any(w in t for w in injury_words):
+        return 'I logged your symptom report. Please tell me the location, pain 0–10, whether there is swelling, and what movements trigger it. I will recommend avoiding aggravating loads; I cannot diagnose or clear you to run. Sudden severe pain, inability to bear weight, fever with a hot swollen joint, or significant calf swelling warrants prompt medical assessment.'
+    return 'I logged your fatigue/sleep report. Today, prioritize recovery and avoid hard training if you feel unusually exhausted. Use /coach for an adjusted recommendation; /checkin can record precise scores.'
+
+def weight_trend(chat):
+    rows=db('body_metrics',query='?chat_id=eq.'+qchat(chat)+'&order=logged_on.desc,created_at.desc&limit=90&select=weight_kg,logged_on')
+    cutoff=today()-datetime.timedelta(days=7)
+    recent=[float(r['weight_kg']) for r in rows if datetime.date.fromisoformat(r['logged_on'])>=cutoff]
+    older=[float(r['weight_kg']) for r in rows if cutoff-datetime.timedelta(days=7)<=datetime.date.fromisoformat(r['logged_on'])<cutoff]
+    w=db('waist_measurements',query='?chat_id=eq.'+qchat(chat)+'&order=logged_on.desc,created_at.desc&limit=2&select=waist_cm,logged_on')
+    msg='BODY COMPOSITION\n'
+    msg+='Weight 7-day average: '+(f'{statistics.mean(recent):.2f} kg' if recent else 'not enough recent entries')+'\n'
+    if older and recent:msg+=f'Change vs previous 7 days: {statistics.mean(recent)-statistics.mean(older):+.2f} kg\n'
+    msg+='Waist: '+(f"{float(w[0]['waist_cm']):.1f} cm ({w[0]['logged_on']})" if w else 'not logged')
+    if len(w)>1:msg+=f"; change {float(w[0]['waist_cm'])-float(w[1]['waist_cm']):+.1f} cm"
+    return msg+'\nLog weight 3 mornings/week and waist every 2 weeks, consistently.'
+
+def run_status(chat):
+    rows=db('running_clearance',query='?chat_id=eq.'+qchat(chat)+'&select=*')
+    r=rows[0] if rows else None
+    if not r or not r.get('clinician_cleared'):
+        return 'RETURN TO RUN: ON HOLD. Record clinician guidance with /clearance yes only after your clinician explicitly clears impact running. HA injection does not automatically establish readiness. Continue prescribed rehab and symptom monitoring.'
+    latest=latest_checkin()
+    if not latest:return 'Clinician clearance recorded, but a current knee/Achilles check-in is needed before planning run/walk. Use /checkin knee 0 achilles 0 fatigue 2 sleep 7.'
+    age=(today()-datetime.date.fromisoformat(latest['logged_on'])).days
+    if age>1:return 'Please log a current knee/Achilles check-in before considering run/walk.'
+    if latest.get('knee_pain') is None or latest.get('achilles_pain') is None:return 'Please record both knee and Achilles scores before run/walk.'
+    if latest['knee_pain']>1 or latest['achilles_pain']>1 or latest.get('injury_note'):
+        return 'Running progression paused because symptoms were reported. Discuss return-to-run readiness with your clinician.'
+    return 'Clinician clearance recorded and current symptoms low. If your clinician also approved a graded progression, discuss an easy run/walk starting point; do not add speed work, and reassess symptoms during and the next morning. /runcheck knee 0 achilles 0 logs next-morning response.'
+
+def compare_day(chat,date):
+    d=date.isoformat()
+    plans=db('coaching_recommendations',query='?chat_id=eq.'+qchat(chat)+'&recommendation_date=eq.'+d+'&limit=1&select=planned_kind,planned_name,planned_details,recommendation')
+    acts=db('activities',query='?chat_id=eq.'+qchat(chat)+'&activity_date=eq.'+d+'&select=kind,distance_m,source')
+    swims=db('strava_imports',query='?activity_date=eq.'+d+'&sport_type=eq.Swim&select=distance_m,swim_analysis,name')
+    if not plans:return 'No saved recommendation for '+d+'. Use /coach to save today’s recommendation.'
+    p=plans[0]; out=['PLAN VS ACTUAL — '+d,'Prescribed: '+p['planned_name'],'Coach: '+p['recommendation']]
+    if not acts:out.append('Actual: no activities imported/logged for this date (not proof of rest).')
+    else:
+        out.append('Actual: '+', '.join(a['kind']+(f" {a['distance_m']}m" if a.get('distance_m') else '') for a in acts))
+        planned_kind=p['planned_kind']
+        if planned_kind=='rest':out.append('Difference: activity logged on a planned recovery day.' )
+        elif not any(a['kind']==planned_kind for a in acts):out.append('Difference: planned activity type not observed.')
+        else:out.append('Activity type matched. Workout details may differ from the prescription.')
+    for sw in swims:
+        parsed=sw.get('swim_analysis') or {}
+        if parsed.get('total_m') is not None:
+            out.append(f"Swim notes: {parsed['total_m']}m vs Strava {sw.get('distance_m') or 0}m; see /swims for intensity breakdown.")
+    return '\n'.join(out)+'\nComparison is descriptive, not a compliance score; missing notes remain unknown.'
+
+def handle_v4(text,chat,cmd,parts):
+    if cmd=='/waist':
+        if len(parts)!=2:return 'Usage: /waist 82.5 (cm)'
+        try:v=float(parts[1]);assert 40<=v<=200
+        except (ValueError,AssertionError):return 'Enter waist in cm, e.g. /waist 82.5'
+        db('waist_measurements','POST',{'chat_id':str(chat),'waist_cm':v,'logged_on':today().isoformat()})
+        return f'Waist logged: {v:.1f} cm. Repeat in two weeks under similar conditions.'
+    if cmd=='/trend':return weight_trend(chat)
+    if cmd=='/checkin' or cmd=='/runcheck':
+        if len(parts)<3 or len(parts)%2!=1:return 'Usage: /checkin fatigue 3 sleep 7 knee 1 achilles 0 (fatigue 1–5, pain 0–10, sleep hours)'
+        cols={'fatigue':'fatigue','sleep':'sleep_hours','knee':'knee_pain','achilles':'achilles_pain'};values={}
+        try:
+            for i in range(1,len(parts),2):
+                key=parts[i].lower();assert key in cols
+                val=float(parts[i+1]);assert (1<=val<=5 if key=='fatigue' else 0<=val<=24 if key=='sleep' else 0<=val<=10)
+                values[cols[key]]=val if key=='sleep' else int(val)
+        except (ValueError,AssertionError):return 'Invalid check-in. Try /checkin fatigue 3 sleep 7 knee 1 achilles 0.'
+        return log_checkin(chat,values)
+    if cmd=='/runstatus':return run_status(chat)
+    if cmd=='/clearance':
+        if len(parts)!=2 or parts[1].lower() not in ('yes','no'):return 'Usage: /clearance yes (only after clinician approval) or /clearance no'
+        cleared=parts[1].lower()=='yes'
+        db('running_clearance','POST',{'chat_id':str(chat),'clinician_cleared':cleared,'cleared_on':today().isoformat() if cleared else None},'?on_conflict=chat_id')
+        return ('Clinician clearance recorded. This is not automatic running authorization; use /runstatus and follow clinician restrictions.' if cleared else 'Running clearance revoked; running progression on hold.')
+    if cmd=='/compare':
+        if len(parts)>1:
+            try:d=datetime.date.fromisoformat(parts[1])
+            except ValueError:return 'Usage: /compare 2026-11-11'
+        else:d=today()
+        return compare_day(chat,d)
+    if cmd=='/dashboard':
+        send_weekly_dashboard(today(),chat)
+        return 'Weekly dashboard sent as an image.'
+    return None
+
+def dashboard_png(date,chat):
+    from PIL import Image,ImageDraw,ImageFont
+    monday=date-datetime.timedelta(days=date.weekday());start=monday-datetime.timedelta(days=21)
+    rows=db('activities',query='?chat_id=eq.'+qchat(chat)+'&activity_date=gte.'+start.isoformat()+'&activity_date=lte.'+date.isoformat()+'&select=kind,distance_m,activity_date')
+    weeks=[]
+    for i in range(4):
+        d=start+datetime.timedelta(days=7*i)
+        w=[r for r in rows if d.isoformat()<=r['activity_date']<(d+datetime.timedelta(days=7)).isoformat()]
+        weeks.append((d,sum(r.get('distance_m') or 0 for r in w if r['kind']=='swim'),sum(r['kind']=='gym' for r in w)))
+    img=Image.new('RGB',(1000,760),'#101827');draw=ImageDraw.Draw(img)
+    def font(size,bold=False):
+        path='/usr/share/fonts/truetype/dejavu/DejaVuSans'+('-Bold' if bold else '')+'.ttf'
+        try:return ImageFont.truetype(path,size)
+        except OSError:return ImageFont.load_default()
+    white='#f1f5f9';muted='#a7b3c7';teal='#2dd4bf';purple='#a78bfa'
+    draw.text((56,42),'ATHLETE OS  /  WEEKLY PULSE',font=font(30,True),fill=white)
+    draw.text((56,90),f'Week of {monday:%d %b %Y}  |  Singapore time',font=font(20),fill=muted)
+    swim=weeks[-1][1];gym=weeks[-1][2]
+    def progress(y,label,value,target,color):
+        draw.text((56,y),label,font=font(25,True),fill=white)
+        draw.text((690,y),f'{value:,} / {target:,}',font=font(23),fill=muted)
+        draw.rounded_rectangle((56,y+44,944,y+69),radius=12,fill='#334155')
+        draw.rounded_rectangle((56,y+44,56+max(1,int(888*min(1,value/target))),y+69),radius=12,fill=color)
+    progress(154,'SWIM (m)',swim,8200,teal);progress(269,'GYM (sessions)',gym,2,purple)
+    draw.text((56,396),'SWIM VOLUME — LAST 4 WEEKS',font=font(24,True),fill=white)
+    for i,(d,m,g) in enumerate(weeks):
+        x=95+i*220;h=int(min(200,m/10000*200))
+        draw.rounded_rectangle((x,650-h,x+108,650),radius=9,fill=teal if i==3 else '#377e87')
+        draw.text((x,665),d.strftime('%d %b'),font=font(18),fill=muted)
+        draw.text((x,625-h),f'{m/1000:.1f} km',font=font(19,True),fill=white)
+    draw.text((56,722),'Based on logged activities; not a medical readiness assessment.',font=font(16),fill=muted)
+    buf=io.BytesIO();img.save(buf,format='PNG');return buf.getvalue()
+
+def send_photo(chat,png,caption):
+    boundary='----athleteos'+secrets.token_hex(12)
+    def field(name,value):return (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode()
+    body=field('chat_id',str(chat))+field('caption',caption)
+    body+=(f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="athlete-os-weekly.png"\r\nContent-Type: image/png\r\n\r\n').encode()+png+b'\r\n'+(f'--{boundary}--\r\n').encode()
+    url='https://api.telegram.org/bot'+env('TELEGRAM_BOT_TOKEN')+'/sendPhoto'
+    request=urllib.request.Request(url,data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
+    with urllib.request.urlopen(request,timeout=20) as r:return json.loads(r.read())
+
+def send_weekly_dashboard(date,chat=None):
+    chat=chat or env('TELEGRAM_CHAT_ID')
+    send_photo(chat,dashboard_png(date,chat),'Athlete OS weekly progress · /trend for body composition')
 
 def request_route(raw_path):
     parsed=urlsplit(raw_path)
@@ -304,6 +539,9 @@ class handler(BaseHTTPRequestHandler):
         if prior: return self.reply(200,{'ok':True,'status':'already sent'})
         send(env('TELEGRAM_CHAT_ID'),daily_coach(date))
         db('notifications','POST',{'notification_key':key})
+        if date.weekday()==0:
+            try: send_weekly_dashboard(date)
+            except Exception as e: print('Weekly dashboard failed',type(e).__name__)
         return self.reply(200,{'ok':True,'status':'sent'})
     def do_POST(self):
         if request_route(self.path)!='/api/telegram': return self.reply(404,{'error':'not found'})

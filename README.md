@@ -44,3 +44,7 @@ Telegram-first daily training coach for the 12-week lean swimmer physique progra
 - Restrict bot to `TELEGRAM_CHAT_ID`, validate Telegram webhook secret, and protect scheduled endpoint with `CRON_SECRET`.
 - Supabase tables have RLS enabled with no public access policies; service-role secret stays in Vercel server environment.
 - Rotate secrets if accidentally exposed.
+
+
+## Routing fix (11 Nov 2026)
+This version uses explicit Vercel rewrites to `api/index.py?route=...` and dispatches by the route query parameter. Redeploy with the repository root containing `api/` and `vercel.json`. Test `/api/health` after deployment.

@@ -17,6 +17,10 @@
     {
       "source": "/api/telegram",
       "destination": "/api/index.py?route=telegram"
+    },
+    {
+      "source": "/api/strava/callback",
+      "destination": "/api/index.py?route=strava_callback"
     }
   ],
   "crons": [

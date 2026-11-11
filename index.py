@@ -1,4 +1,4 @@
-import os, json, datetime, urllib.request, urllib.parse, urllib.error, hmac, hashlib, secrets, time
+import os, json, datetime, urllib.request, urllib.parse, urllib.error, hmac, hashlib, secrets, time, re
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlsplit, parse_qs
@@ -35,34 +35,92 @@ def strava_token():
     db('strava_connections','PATCH',{'access_token':fresh['access_token'],'refresh_token':fresh['refresh_token'],'expires_at':fresh['expires_at']},'?id=eq.1')
     return fresh['access_token']
 def kind_of(a):
-    typ=(a.get('sport_type') or a.get('type') or '').lower()
+    typ=(a.get('sport_type') or a.get('type') or 'Workout').lower()
     if typ=='swim':return 'swim'
-    if typ in ('weighttraining','workout','crossfit'):return 'gym'
+    if typ in ('weighttraining','workout','crossfit','highintensityintervaltraining','functionalstrengthtraining'):return 'gym'
     if typ in ('run','trailrun','virtualrun'):return 'run'
-    if typ in ('ride','virtualride','gravelride','mountainbikeride','ebikeride'):return 'bike'
-    return None
+    if typ in ('ride','virtualride','gravelride','mountainbikeride','ebikeride','emountainbikeride'):return 'bike'
+    return 'other'  # Soccer, Elliptical, Yoga, Walking, etc: never silently discard
+
+def parse_swim(description):
+    """Conservative distance/intent parser. + is simultaneous, commas sequential."""
+    if not description:return {'total_m':None,'sets':[],'unparsed':[]}
+    sets=[];unparsed=[]
+    for raw in description.splitlines():
+        line=raw.strip().strip('•- ')
+        if not line:continue
+        line=re.sub(r'\s+', ' ',line)
+        count=1; body=line
+        m=re.match(r'^(\d+)\s*[x×]\s*(.*)$',body,re.I)
+        if m:count=int(m.group(1));body=m.group(2).strip()
+        if body.startswith('(') and body.endswith(')'):body=body[1:-1]
+        pieces=[x.strip() for x in body.split(',') if x.strip()]
+        parts=[];valid=True
+        for piece in pieces:
+            # A distance with descriptors, e.g. '200 fist + pull' means 200m combined.
+            pm=re.match(r'^(\d+)\s*(?:m\b)?\s*(.*)$',piece,re.I)
+            if not pm:valid=False;break
+            distance=int(pm.group(1)); label=pm.group(2).strip().lower()
+            if distance<1 or distance>20000:valid=False;break
+            if 'skps' in label:focus='warmup/technique'
+            elif any(x in label for x in ('warmup','warm-up','wu')):focus='warmup'
+            elif any(x in label for x in ('cooldown','cool-down','cd')):focus='cooldown'
+            elif any(x in label for x in ('sprint','hard')):focus='speed/hard'
+            elif any(x in label for x in ('fist','pull','kick','drill')):focus='technique'
+            elif any(x in label for x in ('mod','steady','easy')):focus='aerobic'
+            else:focus='unspecified'
+            parts.append({'distance_m':distance,'description':label,'focus':focus,'simultaneous':('+' in label)})
+        if not valid or not parts:unparsed.append(raw);continue
+        sets.append({'original':raw,'repetitions':count,'components':parts,'total_m':count*sum(x['distance_m'] for x in parts)})
+    return {'total_m':sum(x['total_m'] for x in sets) if sets else None,'sets':sets,'unparsed':unparsed}
+
 def sync_strava():
     token=strava_token()
     if not token:return None
     since=int(time.time())-45*86400
-    imported=0;seen=0
-    for page in range(1,5):
+    imported=0;seen=0;updated=0;swims=0
+    # Fetch all pages; the API can return short pages before the end.
+    for page in range(1,11):
         acts=strava_api('/api/v3/athlete/activities?'+urllib.parse.urlencode({'after':since,'per_page':100,'page':page}),token)
         if not acts:break
         for a in acts:
-            kind=kind_of(a)
-            if not kind:continue
-            seen+=1;aid=str(a['id'])
-            old=db('strava_imports',query='?activity_id=eq.'+aid+'&select=activity_id')
-            if old:continue
+            seen+=1;aid=str(a['id']);kind=kind_of(a)
+            old=db('strava_imports',query='?activity_id=eq.'+aid+'&select=activity_id,description')
+            if old and (kind!='swim' or old[0].get('description') is not None):continue
             date=(a.get('start_date_local') or a.get('start_date') or '')[:10]
             if not date:continue
             distance=round(a.get('distance') or 0) if kind in ('swim','run','bike') else None
+            description=None;parsed=None
+            if kind=='swim':
+                # Summary activities do not reliably contain descriptions.
+                detail=strava_api('/api/v3/activities/'+aid,token)
+                description=detail.get('description') or ''
+                parsed=parse_swim(description)
+                swims+=1
+            if old:
+                db('strava_imports','PATCH',{'description':description,'swim_analysis':parsed},'?activity_id=eq.'+aid)
+                updated+=1
+                continue
             db('activities','POST',{'chat_id':env('TELEGRAM_CHAT_ID'),'kind':kind,'distance_m':distance,'activity_date':date,'source':'strava'})
-            db('strava_imports','POST',{'activity_id':aid,'name':a.get('name','')[:500],'description':None,'sport_type':a.get('sport_type') or a.get('type'),'moving_time_s':a.get('moving_time'),'elapsed_time_s':a.get('elapsed_time'),'average_heartrate':a.get('average_heartrate'),'distance_m':distance,'activity_date':date})
+            db('strava_imports','POST',{'activity_id':aid,'name':a.get('name','')[:500],'description':description,'swim_analysis':parsed,'sport_type':a.get('sport_type') or a.get('type'),'moving_time_s':a.get('moving_time'),'elapsed_time_s':a.get('elapsed_time'),'average_heartrate':a.get('average_heartrate'),'distance_m':distance,'activity_date':date})
             imported+=1
-        if len(acts)<100:break
-    return {'imported':imported,'recognized':seen}
+    return {'imported':imported,'recognized':seen,'updated':updated,'swims':swims}
+
+def swim_report():
+    rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=5&select=name,activity_date,distance_m,swim_analysis')
+    if not rows:return 'No imported swims yet. Send /sync first.'
+    lines=['RECENT SWIMS — parsed descriptions']
+    for r in rows:
+        parsed=r.get('swim_analysis') or {}
+        parts=parsed.get('sets') or []
+        distance=parsed.get('total_m')
+        focus={}
+        for group in parts:
+            for part in group['components']:
+                category=part['focus'];focus[category]=focus.get(category,0)+part['distance_m']*group['repetitions']
+        summary=', '.join(f'{k} {v}m' for k,v in focus.items()) or 'No structured description'
+        lines.append(f"{r.get('activity_date')}: {r.get('name') or 'Swim'} | Strava {r.get('distance_m') or 0}m | notes {distance if distance is not None else '?'}m\n{summary}"+(f" | {len(parsed.get('unparsed',[]))} lines need review" if parsed.get('unparsed') else ''))
+    return '\n\n'.join(lines)
 def oauth_state():
     stamp=str(int(time.time())); sig=hmac.new(env('TELEGRAM_WEBHOOK_SECRET').encode(),stamp.encode(),hashlib.sha256).hexdigest()
     return stamp+'.'+sig
@@ -92,7 +150,7 @@ def message_today(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/connect — authorize Strava\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/connect — authorize Strava\n/help — commands'
     if cmd=='/today': return message_today(today())
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'
@@ -104,10 +162,12 @@ def handle(text,chat_id):
         try:
             result=sync_strava()
             if result is None:return 'Strava is not connected. Send /connect first.'
-            return f"Strava synced: {result['imported']} new workouts imported; {result['recognized']} recognized in the past 45 days. /progress shows your updated totals."
+            return f"Strava synced: {result['imported']} new workouts; {result['recognized']} total activities found in the last 45 days; {result['updated']} existing swim descriptions backfilled. Try /swims and /progress."
         except Exception as e:
             print('Strava sync failed',type(e).__name__)
             return 'Strava sync failed. Check Vercel logs and Strava configuration.'
+    if cmd=='/swims':
+        return swim_report()
     if cmd=='/weight':
         if len(parts)!=2: return 'Usage: /weight 74.8'
         try: value=float(parts[1]); assert 35<=value<=250

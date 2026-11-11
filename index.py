@@ -13,7 +13,7 @@ def req(url, payload=None, headers=None, method=None):
     with urllib.request.urlopen(urllib.request.Request(url,data=data,headers=h,method=method),timeout=12) as r: return json.loads(r.read() or b'{}')
 def db(table,method='GET',data=None,query=''):
     url=env('SUPABASE_URL').rstrip('/')+'/rest/v1/'+table+query
-    return req(url,data,{'apikey':env('SUPABASE_SERVICE_ROLE_KEY'),'Authorization':'Bearer '+env('SUPABASE_SERVICE_ROLE_KEY'),'Prefer':'return=representation'},method)
+    return req(url,data,{'apikey':env('SUPABASE_SERVICE_ROLE_KEY'),'Authorization':'Bearer '+env('SUPABASE_SERVICE_ROLE_KEY'),'Prefer':'return=representation,resolution=merge-duplicates' if table=='coaching_recommendations' and method=='POST' else 'return=representation'},method)
 def send(chat_id,message):
     return req('https://api.telegram.org/bot'+env('TELEGRAM_BOT_TOKEN')+'/sendMessage',{'chat_id':chat_id,'text':message[:3900]})
 
@@ -147,11 +147,82 @@ def message_today(date):
     week,name,kind,details,restriction=plan(date)
     return f'🏊 ATHLETE OS | Week {week}/12\n{date:%a %d %b}\n\nTODAY: {name}\n{details}\n\n{restriction}\n\nNutrition: ~145g protein; initial calorie trial ~2200–2400 kcal/day, adjust by trends and recovery.\n\nLog: /done swim 2800 | /done gym | /weight 75.0 | /knee 0'
 
+def bar(value,target,width=10):
+    n=max(0,min(width,round(width*value/target))) if target else 0
+    return '█'*n+'░'*(width-n)+f' {round(100*value/target) if target else 0}%'
+
+def training_context(date):
+    monday=date-datetime.timedelta(days=date.weekday())
+    recent=date-datetime.timedelta(days=7)
+    rows=db('activities',query='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_date=gte.'+recent.isoformat()+'&activity_date=lte.'+date.isoformat()+'&select=kind,distance_m,activity_date,source')
+    week=[r for r in rows if r['activity_date']>=monday.isoformat()]
+    swim=sum(r.get('distance_m') or 0 for r in week if r['kind']=='swim')
+    gym=sum(1 for r in week if r['kind']=='gym')
+    today_rows=[r for r in rows if r['activity_date']==date.isoformat()]
+    knee=db('recovery_logs',query='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&logged_on=lte.'+date.isoformat()+'&order=logged_on.desc&limit=1&select=pain_score,logged_on')
+    return {'swim':swim,'gym':gym,'today_rows':today_rows,'recent':rows,'knee':knee[0] if knee else None}
+
+def recommend(date):
+    week,name,kind,details,restriction=plan(date)
+    ctx=training_context(date)
+    reasons=[];adjustment='Follow the scheduled session, adjusting effort to how you feel.'
+    knee=ctx['knee']; score=knee.get('pain_score') if knee else None
+    age=(date-datetime.date.fromisoformat(knee['logged_on'])).days if knee else None
+    if kind=='rest':
+        adjustment='Keep today as recovery; do not add intensity to chase weekly targets.'
+        reasons.append('Recovery is scheduled today.')
+    elif ctx['today_rows']:
+        adjustment='A workout is already logged today. Prioritize recovery rather than repeating the scheduled session.'
+        reasons.append('Activity already recorded today.')
+    elif score is not None and age is not None and age<=3 and score>=3:
+        adjustment='Knee pain was recently elevated. Avoid provoking activities; choose symptom-tolerated recovery and check with your clinician if it persists.'
+        reasons.append(f'Last knee score: {score}/10 ({age} day(s) ago).')
+    elif kind=='swim':
+        if ctx['swim']>=8200:
+            adjustment='Weekly swim target already reached. Consider a short easy technique session or recovery instead of adding volume.'
+            reasons.append(f'{ctx["swim"]:,} m swimming already logged this week.')
+        elif ctx['swim']>=6500:
+            adjustment='You are close to your swim target. Keep the session controlled and shorten it if fatigued.'
+            reasons.append(f'{ctx["swim"]:,} m swimming logged this week.')
+        else:
+            reasons.append(f'{ctx["swim"]:,} / 8,200 m swimming logged this week.')
+    elif kind=='gym':
+        if ctx['gym']>=2:
+            adjustment='Two gym sessions already recorded this week. Consider mobility or an easy recovery session instead.'
+        reasons.append(f'{ctx["gym"]} / 2 gym sessions logged this week.')
+    if not knee:reasons.append('No knee pain score logged yet; use /knee 0–10 to improve safety checks.')
+    elif age is not None and age>3:reasons.append(f'Last knee score is {age} days old; log an updated score if symptoms changed.')
+    return {'week':week,'name':name,'kind':kind,'details':details,'restriction':restriction,'adjustment':adjustment,'reasons':reasons,'context':ctx}
+
+def coach_message(date):
+    rec=recommend(date); ctx=rec['context']
+    return (f'🦄 ATHLETE OS | Week {rec["week"]}/12 | {date:%a %d %b}\n\n'
+      f'PLAN: {rec["name"]}\n{rec["details"]}\n\n'
+      f'COACH RECOMMENDS\n{rec["adjustment"]}\n\n'
+      f'WHY\n'+'\n'.join('• '+r for r in rec['reasons'])+'\n\n'
+      f'WEEKLY PROGRESS\n🏊 {ctx["swim"]:,} / 8,200 m\n{bar(ctx["swim"],8200)}\n'
+      f'🏋️ {ctx["gym"]} / 2 gym\n{bar(ctx["gym"],2)}\n\n'
+      f'{rec["restriction"]}\n\nYour actual workout will be read from Strava after sync. /coach refreshes this recommendation.')
+
+def save_recommendation(date, message):
+    # Persist exactly what was recommended for later comparison with actual workouts.
+    rec=recommend(date)
+    db('coaching_recommendations','POST',{'chat_id':env('TELEGRAM_CHAT_ID'),'recommendation_date':date.isoformat(),
+       'planned_kind':rec['kind'],'planned_name':rec['name'],'planned_details':rec['details'],
+       'recommendation':rec['adjustment'],'reasoning':rec['reasons'],'message':message},
+       '?on_conflict=chat_id,recommendation_date')
+
+def daily_coach(date):
+    message=coach_message(date)
+    save_recommendation(date,message)
+    return message
+
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/connect — authorize Strava\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/help — commands'
     if cmd=='/today': return message_today(today())
+    if cmd=='/coach': return daily_coach(today())
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'
     if cmd=='/connect':
@@ -231,7 +302,7 @@ class handler(BaseHTTPRequestHandler):
         date=today(); key='daily:'+date.isoformat()
         prior=db('notifications',query='?notification_key=eq.'+key+'&select=id')
         if prior: return self.reply(200,{'ok':True,'status':'already sent'})
-        send(env('TELEGRAM_CHAT_ID'),message_today(date))
+        send(env('TELEGRAM_CHAT_ID'),daily_coach(date))
         db('notifications','POST',{'notification_key':key})
         return self.reply(200,{'ok':True,'status':'sent'})
     def do_POST(self):

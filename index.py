@@ -161,6 +161,52 @@ def swim_performance_report():
     lines.append('Note: pool lap boundaries and written intervals may differ; HR is not always available or reliable in water.')
     return '\n'.join(lines)
 
+def swim_streams_diagnostic():
+    """Report only stream availability and sampling resolution; never expose tokens or raw HR."""
+    rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=1&select=activity_id,name,activity_date,distance_m')
+    if not rows:return 'No swim found. Send /sync first.'
+    r=rows[0]
+    token=strava_token()
+    if not token:return 'Strava is not connected. Send /connect.'
+    activity_id=urllib.parse.quote(str(r['activity_id']),safe='')
+    path='/api/v3/activities/'+activity_id+'/streams?'+urllib.parse.urlencode({'keys':'time,distance,velocity_smooth,heartrate,cadence','key_by_type':'true'})
+    try:
+        streams=strava_api(path,token)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401,403):return 'Strava denied stream access (HTTP '+str(exc.code)+'). Check permissions or reconnect.'
+        if exc.code==404:return 'Strava returned 404: streams are unavailable for this swim.'
+        if exc.code==429:return 'Strava API rate limit reached. Try again later.'
+        return 'Strava stream request failed (HTTP '+str(exc.code)+').'
+    except Exception as exc:
+        print('Swim streams diagnostic error',type(exc).__name__)
+        return 'Could not fetch Strava streams right now.'
+    if not isinstance(streams,dict):return 'Strava returned no keyed stream data for this swim.'
+    lines=['SWIM STREAMS DIAGNOSTIC — '+str(r['activity_date']),str(r.get('name') or 'Swim'),
+           'Available streams: '+(', '.join(sorted(streams.keys())) if streams else 'none')]
+    for key in ('time','distance','velocity_smooth','heartrate','cadence'):
+        item=streams.get(key)
+        if not isinstance(item,dict):
+            lines.append(key+': unavailable')
+            continue
+        values=item.get('data')
+        if not isinstance(values,list):
+            lines.append(key+': no samples')
+            continue
+        desc=key+': '+str(len(values))+' samples'
+        if key=='time' and len(values)>1:
+            try:
+                diffs=[float(b)-float(a) for a,b in zip(values,values[1:]) if isinstance(a,(int,float)) and isinstance(b,(int,float)) and b>a]
+                if diffs:desc+='; median interval '+str(round(statistics.median(diffs),1))+'s'
+            except (TypeError,ValueError):pass
+        if key=='distance' and len(values)>1:
+            try:
+                diffs=[float(b)-float(a) for a,b in zip(values,values[1:]) if isinstance(a,(int,float)) and isinstance(b,(int,float)) and b>a]
+                if diffs:desc+='; median positive step '+str(round(statistics.median(diffs),1))+'m'
+            except (TypeError,ValueError):pass
+        lines.append(desc)
+    lines.append('This checks stream availability, not Garmin pool-length boundaries, stroke counts or SWOLF.')
+    return '\n'.join(lines)
+
 def swim_report():
     rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=5&select=name,activity_date,distance_m,swim_analysis')
     if not rows:return 'No imported swims yet. Send /sync first.'
@@ -278,7 +324,7 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
     extra=handle_v4(text,chat_id,cmd,parts)
     if extra is not None:return extra
     if cmd=='/today': return message_today(today())
@@ -299,6 +345,8 @@ def handle(text,chat_id):
             return 'Strava sync failed. Check Vercel logs and Strava configuration.'
     if cmd=='/swims':
         return swim_report()
+    if cmd=='/swimstreams':
+        return swim_streams_diagnostic()
     if cmd in ('/swimdetail','/laps'):
         return swim_performance_report()
     if cmd=='/weight':

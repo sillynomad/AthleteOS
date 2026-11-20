@@ -247,19 +247,35 @@ def swim_analysis():
     for i in range(len(durations)):
         vals=[float(h[j]) for j,(tm,_) in enumerate(samples) if j<len(h) and isinstance(h[j],(int,float)) and h[j]>0 and crossings[i]<=tm<crossings[i+1]]
         hrs.append(round(statistics.mean(vals)) if vals else None)
+    valid_durations=[v for v,ok in zip(durations,plausible) if ok]
     lines=['SWIM ANALYSIS — '+str(r['activity_date']),str(r.get('name') or 'Swim'),
            f'Estimated 50m segments: {len(durations)} | plausible durations: {sum(plausible)}/{len(plausible)}',
            'Strava distance crossings are estimates, not Garmin pool lengths. Rest periods may be included.']
+    if valid_durations:
+        mean=statistics.mean(valid_durations)
+        lines.append('Overall estimated pace: '+str(pace_per_100(sum(valid_durations),50*len(valid_durations))))
+        if len(valid_durations)>=3:
+            lines.append(f'50m variability: {statistics.pstdev(valid_durations):.1f}s standard deviation; range {min(valid_durations):.1f}-{max(valid_durations):.1f}s')
+    lines.append('500M BLOCKS (estimated)')
+    for block in range(0,len(durations),10):
+        chunk=durations[block:block+10];flags=plausible[block:block+10];heart=[x for x in hrs[block:block+10] if x is not None]
+        if len(chunk)<10:continue
+        pace=pace_per_100(sum(chunk),500) if all(flags) else 'unreliable'
+        lines.append(f'{block*50:>4}-{(block+10)*50}m: {pace}; HR {round(statistics.mean(heart)) if heart else "n/a"} bpm')
+    # Early optical HR often locks on late in water; avoid presenting it as a clinical metric.
+    hr_valid=[x for x in hrs[6:] if x is not None and 90<=x<=210]
+    if len(hr_valid)>=10:
+        half=len(hr_valid)//2
+        lines.append(f'HR trend after first 300m: {round(statistics.mean(hr_valid[:half]))} to {round(statistics.mean(hr_valid[half:]))} bpm (descriptive, not cardiac drift)')
+    else:lines.append('HR trend: insufficient reliable post-warmup readings.')
+    lines.append('50M SEGMENTS (estimated)')
     for i,(duration,ok,hr) in enumerate(zip(durations,plausible,hrs)):
-        if i>=12:break
         pace=pace_per_100(duration,50) if ok else 'unreliable'
-        lines.append(f'{i+1:>2}. 50m · {pace} · HR {hr if hr is not None else "n/a"} bpm')
-    if len(durations)>12:lines.append(f'... {len(durations)-12} more segments not shown.')
+        lines.append(f'{i+1:>2}. {pace} · HR {hr if hr is not None else "n/a"}')
     if len(durations)>=20 and all(plausible[:10]) and all(plausible[-10:]):
-        first=sum(durations[:10]);last=sum(durations[-10:])
-        lines.append('First 500m: '+str(pace_per_100(first,500))+' | Last 500m: '+str(pace_per_100(last,500)))
+        lines.append('First 500m: '+str(pace_per_100(sum(durations[:10]),500))+' | Last 500m: '+str(pace_per_100(sum(durations[-10:]),500)))
     else:lines.append('First/last 500m comparison withheld due to insufficient or implausible splits.')
-    lines.append('Stroke counts, SWOLF and exact turn boundaries require Garmin data.')
+    lines.append('Caution: HR artefacts, rests, and distance smoothing can affect these estimates. Stroke counts and SWOLF require Garmin FIT data.')
     return '\n'.join(lines)
 
 # Explicit daily overrides are stored separately from the original schedule.

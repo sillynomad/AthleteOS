@@ -605,7 +605,7 @@ def handle(text,chat_id):
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
-    if cmd=='/garminsync':return garmin_sync()
+    if cmd=='/garminsync':return garmin_sync(5)
     if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
     if cmd=='/garmin':return garmin_recent()
     if cmd=='/plan':
@@ -864,7 +864,7 @@ class handler(BaseHTTPRequestHandler):
             sync_strava()
         except Exception as e: print('Scheduled Strava sync failed',type(e).__name__)
         try:
-            if env('GARMIN_PERSONAL_API_KEY'): garmin_sync(10)
+            if env('GARMIN_PERSONAL_API_KEY'): garmin_sync(2)
         except Exception as e: print('Scheduled Garmin sync failed',type(e).__name__)
         date=today(); key='daily:'+date.isoformat()
         prior=db('notifications',query='?notification_key=eq.'+key+'&select=id')

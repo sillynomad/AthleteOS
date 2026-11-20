@@ -363,6 +363,70 @@ def swim_trends():
     lines.append('FIT active-length times exclude rests. Turns, drills, stroke type and interval intensity affect pace, stroke counts and SWOLF.')
     return '\n'.join(lines)[:3800]
 
+
+# Freestyle-only 50m progression: length-level FIT metrics, excluding drills and non-freestyle.
+def swim_freestyle_progress():
+    cutoff=(datetime.datetime.now(TZ).date()-datetime.timedelta(days=90)).isoformat()
+    base='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&activity_date=gte.'+cutoff+'&order=activity_date.asc,start_time_local.asc&select=activity_id,activity_date,name'
+    sessions=[];unclassified=0
+    for offset in range(0,200,100):
+        page=db('garmin_activities',query=base+'&limit=100&offset='+str(offset)) or []
+        for a in page:
+            lengths=db('garmin_swim_lengths',query='?activity_id=eq.'+str(a['activity_id'])+'&order=length_index.asc&select=distance_m,timer_s,strokes,stroke_type') or []
+            if not lengths:continue
+            pool=round(sum(float(x['distance_m']) for x in lengths)/len(lengths),2)
+            if pool!=50.0 or any(abs(float(x['distance_m'])-50)>0.1 for x in lengths):continue
+            def is_free(x):
+                typ=str(x.get('stroke_type') or '').strip().lower()
+                return typ in ('freestyle','front_crawl','front crawl','0')
+            free=[x for x in lengths if is_free(x) and isinstance(x.get('timer_s'),(int,float)) and x['timer_s']>0]
+            unclassified+=sum(not str(x.get('stroke_type') or '').strip() for x in lengths)
+            if len(free)<4:continue
+            distance=sum(float(x['distance_m']) for x in free)
+            seconds=sum(float(x['timer_s']) for x in free)
+            valid=[x for x in free if isinstance(x.get('strokes'),int) and x['strokes']>0]
+            strokes=statistics.mean(x['strokes'] for x in valid) if valid else None
+            swolf=statistics.mean(float(x['timer_s'])+x['strokes'] for x in valid) if valid else None
+            sessions.append({'id':a['activity_id'],'date':a['activity_date'],'name':a.get('name') or '',
+                             'distance':distance,'pace':seconds*100/distance,'stroke':strokes,'swolf':swolf,
+                             'free_lengths':len(free),'all_lengths':len(lengths)})
+        if len(page)<100:break
+    if not sessions:
+        return '50M FREESTYLE PROGRESSION\nNo sessions with at least four explicitly recorded freestyle lengths in a 50m pool. Check FIT stroke classifications.'
+    def pace(v):
+        n=round(v);return str(n//60)+':'+str(n%60).zfill(2)+'/100m'
+    def metric(xs,key):
+        vals=[x[key] for x in xs if x[key] is not None]
+        return statistics.median(vals) if vals else None
+    def fmt(v):return f'{v:.1f}' if v is not None else 'n/a'
+    lines=['50M FREESTYLE PROGRESSION — last 90 days',
+           str(len(sessions))+' qualifying 50m sessions (freestyle lengths only; minimum 200m per session)',
+           'All freestyle session medians: pace '+pace(metric(sessions,'pace'))+
+           ' | strokes/50m '+fmt(metric(sessions,'stroke'))+' | SWOLF '+fmt(metric(sessions,'swolf'))]
+    if len(sessions)>=6:
+        # Chronological halves; avoid asserting improvement from mixed workout types.
+        midpoint=len(sessions)//2
+        early=sessions[:midpoint];late=sessions[midpoint:]
+        lines.append('EARLIER vs LATER ('+str(len(early))+' vs '+str(len(late))+' sessions)')
+        lines.append('Pace '+pace(metric(early,'pace'))+' -> '+pace(metric(late,'pace')))
+        lines.append('Strokes/50m '+fmt(metric(early,'stroke'))+' -> '+fmt(metric(late,'stroke')))
+        lines.append('SWOLF '+fmt(metric(early,'swolf'))+' -> '+fmt(metric(late,'swolf')))
+    else:
+        lines.append('At least 6 qualifying 50m sessions needed for an earlier-vs-later trend.')
+    target=sessions[-1]
+    matched=[x for x in sessions[:-1] if abs(x['distance']-target['distance'])/target['distance']<=0.25
+             and abs(x['pace']-target['pace'])/target['pace']<=0.05]
+    lines.append('LATEST 50M FREESTYLE — '+str(target['date'])+' | '+str(round(target['distance']))+'m freestyle | '+pace(target['pace']))
+    if matched:
+        lines.append('MATCHED HISTORY ('+str(len(matched))+' sessions, freestyle distance ±25%, pace ±5%)')
+        lines.append('Strokes/50m '+fmt(target['stroke'])+' vs '+fmt(metric(matched,'stroke'))+
+                     ' | SWOLF '+fmt(target['swolf'])+' vs '+fmt(metric(matched,'swolf')))
+    else:
+        lines.append('No closely matched earlier 50m freestyle sessions; showing trend without claiming an efficiency change.')
+    lines.append('Only Garmin-classified freestyle lengths included. Drill/mixed/unknown strokes excluded. FIT labels can be imperfect.')
+    lines.append('Active-length pace excludes rest. Interval intensity and push-offs still vary; earlier/later medians are descriptive, not proof of improvement.')
+    return '\n'.join(lines)[:3800]
+
 def garmin_recent():
     if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin not configured. Add GARMIN_PERSONAL_API_KEY in Vercel Production settings.'
     try:
@@ -782,7 +846,7 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/garminbackfill — import 90 days of Garmin swims (repeat to continue)\n/garminbackfillstatus — show backfill progress\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/swimprogress — 90-day 50m freestyle progression\n/garminbackfill — import 90 days of Garmin swims (repeat to continue)\n/garminbackfillstatus — show backfill progress\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
     extra=handle_v4(text,chat_id,cmd,parts)
     if extra is not None:return extra
     if cmd=='/today': return coach_message(today())
@@ -791,6 +855,7 @@ def handle(text,chat_id):
     if cmd=='/garminbackfillstatus':return garmin_backfill_status()
     if cmd=='/garminbackfill':return garmin_backfill(reset=len(parts)>1 and parts[1].lower()=='reset')
     if cmd=='/swimtrends':return swim_trends()
+    if cmd=='/swimprogress':return swim_freestyle_progress()
     if cmd=='/garminsync':return garmin_sync(5)
     if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
     if cmd=='/garmin':return garmin_recent()

@@ -427,6 +427,77 @@ def swim_freestyle_progress():
     lines.append('Active-length pace excludes rest. Interval intensity and push-offs still vary; earlier/later medians are descriptive, not proof of improvement.')
     return '\n'.join(lines)[:3800]
 
+
+def strava_swim_context():
+    """Use matched Strava notes to explain Garmin FIT performance, never infer exact interval boundaries."""
+    cutoff=(datetime.datetime.now(TZ).date()-datetime.timedelta(days=90)).isoformat()
+    q='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&activity_date=gte.'+cutoff+'&order=activity_date.desc,start_time_local.desc&limit=100&select=activity_id,activity_date,strava_activity_id,match_status,name'
+    garmin=db('garmin_activities',query=q) or []
+    if not garmin:return 'No Garmin swims found in the last 90 days.'
+    strava=db('strava_imports',query='?activity_date=gte.'+cutoff+'&sport_type=eq.Swim&order=activity_date.desc&limit=200&select=activity_id,activity_date,description,swim_analysis,name') or []
+    by_id={str(x['activity_id']):x for x in strava}
+    def classify(row):
+        description=str(row.get('description') or '')
+        parsed=row.get('swim_analysis')
+        if not isinstance(parsed,dict):parsed=parse_swim(description)
+        focus=set()
+        for item in parsed.get('sets') or []:
+            for part in item.get('components') or []:
+                f=part.get('focus')
+                if f and f!='unspecified':focus.add(f)
+        low=description.lower()
+        if re.search(r'\\b(threshold|tempo|css)\\b',low):focus.add('threshold')
+        if re.search(r'\\b(intervals?|repeats?)\\b',low):focus.add('intervals')
+        if re.search(r'\\b(endurance|continuous|long aerobic)\\b',low):focus.add('endurance')
+        if re.search(r'\\b(sprint|fast|hard)\\b',low):focus.add('speed/hard')
+        if re.search(r'\\b(drill|fist|pull|kick|skps)\\b',low):focus.add('technique')
+        if re.search(r'\\b(recovery|easy)\\b',low):focus.add('aerobic')
+        substantive=focus-{'warmup','cooldown','warmup/technique'}
+        if not description.strip():return 'no notes',focus,parsed
+        if len(substantive)>1:return 'mixed',focus,parsed
+        if 'threshold' in substantive:return 'threshold',focus,parsed
+        if 'speed/hard' in substantive:return 'speed',focus,parsed
+        if 'technique' in substantive:return 'technique',focus,parsed
+        if 'intervals' in substantive:return 'intervals',focus,parsed
+        if 'endurance' in substantive or 'aerobic' in substantive:return 'aerobic',focus,parsed
+        return 'unclassified',focus,parsed
+    records=[];matched=0;with_notes=0
+    for a in garmin:
+        sid=str(a.get('strava_activity_id') or '')
+        row=by_id.get(sid) if a.get('match_status')=='matched' else None
+        if row:matched+=1
+        label,focus,parsed=classify(row) if row else ('unmatched',set(),{})
+        if row and (row.get('description') or '').strip():with_notes+=1
+        records.append((a,row,label,focus,parsed))
+    lines=['SWIM CONTEXT — Garmin FIT + Strava notes (90 days)',
+           f'Garmin swims: {len(records)} | linked to Strava: {matched} | with notes: {with_notes}',
+           'SESSION INTENT (from your Strava descriptions)']
+    for label in ('aerobic','threshold','speed','technique','intervals','mixed','unclassified','no notes','unmatched'):
+        count=sum(x[2]==label for x in records)
+        if count:lines.append(f'{label}: {count}')
+    lines.append('LATEST SWIMS — notes contextualize Garmin metrics')
+    shown=0
+    for a,row,label,focus,parsed in records:
+        if shown>=6:break
+        lengths=db('garmin_swim_lengths',query='?activity_id=eq.'+str(a['activity_id'])+'&order=length_index.asc&select=distance_m,timer_s,strokes,stroke_type') or []
+        if not lengths:continue
+        dist=sum(float(x['distance_m']) for x in lengths)
+        seconds=sum(float(x['timer_s']) for x in lengths)
+        if dist<=0 or seconds<=0:continue
+        pool=round(dist/len(lengths),1)
+        pace=round(seconds*100/dist)
+        parsed_total=parsed.get('total_m') if isinstance(parsed,dict) else None
+        notes=(row or {}).get('description') or ''
+        summary=' '.join(notes.split())[:110] if notes else 'No linked workout notes'
+        lines.append(f'{a["activity_date"]} | {dist:g}m | {pool:g}m pool | {pace//60}:{pace%60:02d}/100m | {label}')
+        lines.append('  Strava: '+summary)
+        if parsed_total and abs(parsed_total-dist)>max(100,0.1*dist):
+            lines.append(f'  Note: parsed set total {parsed_total}m differs from Garmin {dist:g}m; not mapping sets to lengths')
+        shown+=1
+    lines.append('Labels reflect notes, not confirmed Garmin interval boundaries. Mixed sessions are not assigned a single training intensity.')
+    lines.append('No notes or unmatched sessions remain unclassified; no date-only guessing. Use /sync to refresh Strava history.')
+    return '\n'.join(lines)[:3800]
+
 def garmin_recent():
     if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin not configured. Add GARMIN_PERSONAL_API_KEY in Vercel Production settings.'
     try:
@@ -508,7 +579,7 @@ def parse_swim(description):
 def sync_strava():
     token=strava_token()
     if not token:return None
-    since=int(time.time())-45*86400
+    since=int(time.time())-90*86400
     imported=0;seen=0;updated=0;swims=0
     # Fetch all pages; the API can return short pages before the end.
     for page in range(1,11):
@@ -846,7 +917,7 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/swimprogress — 90-day 50m freestyle progression\n/garminbackfill — import 90 days of Garmin swims (repeat to continue)\n/garminbackfillstatus — show backfill progress\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/swimprogress — 90-day 50m freestyle progression\n/swimcontext — Garmin swims interpreted with Strava workout notes\n/garminbackfill — import 90 days of Garmin swims (repeat to continue)\n/garminbackfillstatus — show backfill progress\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
     extra=handle_v4(text,chat_id,cmd,parts)
     if extra is not None:return extra
     if cmd=='/today': return coach_message(today())
@@ -856,6 +927,7 @@ def handle(text,chat_id):
     if cmd=='/garminbackfill':return garmin_backfill(reset=len(parts)>1 and parts[1].lower()=='reset')
     if cmd=='/swimtrends':return swim_trends()
     if cmd=='/swimprogress':return swim_freestyle_progress()
+    if cmd=='/swimcontext':return strava_swim_context()
     if cmd=='/garminsync':return garmin_sync(5)
     if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
     if cmd=='/garmin':return garmin_recent()

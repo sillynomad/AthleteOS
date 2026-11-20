@@ -180,6 +180,77 @@ def garmin_swim_report():
     lines.append('FIT stroke counts and length times depend on watch recording accuracy.')
     return '\n'.join(lines)
 
+
+# v5.5: Read-only longitudinal Garmin pool swim coaching. No new tables required.
+def swim_history(max_swims=12):
+    q='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&order=activity_date.desc,start_time_local.desc&limit='+str(max_swims)+'&select=activity_id,activity_date,name,swim_length_count'
+    rows=db('garmin_activities',query=q) or []
+    history=[]
+    for a in rows:
+        lengths=db('garmin_swim_lengths',query='?activity_id=eq.'+str(a['activity_id'])+'&order=length_index.asc&select=distance_m,timer_s,strokes,avg_hr') or []
+        if not lengths:continue
+        total=sum(float(x['distance_m']) for x in lengths)
+        secs=sum(float(x['timer_s']) for x in lengths)
+        if total<=0 or secs<=0:continue
+        strokes=[x for x in lengths if isinstance(x.get('strokes'),int)]
+        stroke_rate=(sum(x['strokes'] for x in strokes)/len(strokes)) if strokes else None
+        swolf=(sum(float(x['timer_s'])+x['strokes'] for x in strokes)/len(strokes)) if strokes else None
+        half=total/2;covered=0;first=[];second=[]
+        for x in lengths:
+            mid=covered+float(x['distance_m'])/2
+            (first if mid<=half else second).append(x)
+            covered+=float(x['distance_m'])
+        def segment_pace(group):
+            dist=sum(float(x['distance_m']) for x in group)
+            return sum(float(x['timer_s']) for x in group)*100/dist if dist else None
+        first_pace=segment_pace(first);last_pace=segment_pace(second)
+        drift=(last_pace-first_pace)/first_pace*100 if first_pace and last_pace else None
+        history.append({'id':a['activity_id'],'date':a['activity_date'],'distance':total,'seconds':secs,
+                        'pace':secs*100/total,'stroke':stroke_rate,'swolf':swolf,'drift':drift,
+                        'lengths':len(lengths),'pool_m':round(total/len(lengths),2)})
+    return history
+
+def swim_trends():
+    history=swim_history()
+    if not history:return 'No Garmin pool lengths found. Run /garminsync first.'
+    latest=history[0]
+    def pace_str(v):
+        n=round(v)
+        return str(n//60)+':'+str(n%60).zfill(2)+'/100m'
+    def fmt(v,unit=''):
+        return f'{v:.1f}{unit}' if v is not None else 'n/a'
+    lines=['SWIM TRENDS — Garmin FIT','Imported pool swims: '+str(len(history))+' (up to 12 most recent)',
+           'LATEST: '+str(latest['date'])+' | '+str(round(latest['distance']))+'m | '+pace_str(latest['pace']),
+           'Strokes/length '+fmt(latest['stroke'])+' | SWOLF '+fmt(latest['swolf'])+
+           ' | second-half pace change '+fmt(latest['drift'],'%')]
+    if len(history)<3:
+        lines.append('Baseline building: at least 3 pool swims needed for trends. These are not enough to establish improvement.')
+    else:
+        recent=history[:min(4,len(history))]
+        older=history[min(4,len(history)):]
+        lines.append('RECENT SESSIONS')
+        for x in recent:
+            lines.append(str(x['date'])+' '+str(round(x['distance']))+'m | '+pace_str(x['pace'])+' | strokes '+fmt(x['stroke'])+' | SWOLF '+fmt(x['swolf']))
+        if older:
+            # Compare at similar paces and same pool length, to reduce misleading SWOLF comparisons.
+            similar=[x for x in older if abs(x['pace']-latest['pace'])/latest['pace']<=0.05 and
+                     abs(x['distance']-latest['distance'])/latest['distance']<=0.25 and x['pool_m']==latest['pool_m'] and x['stroke'] is not None]
+            if similar and latest['stroke'] is not None:
+                baseline=statistics.median(x['stroke'] for x in similar)
+                lines.append('MATCHED-SESSION BENCHMARK ('+str(len(similar))+' older swim(s), same pool length, pace within 5%, distance within 25%):')
+                lines.append('Strokes/length '+fmt(latest['stroke'])+' vs baseline '+fmt(baseline)+
+                             ' ('+fmt(latest['stroke']-baseline,' strokes')+'). Lower may indicate more distance per stroke at similar pace.')
+            else:lines.append('No comparable older swims yet (same pool length, pace ±5%, distance ±25%); avoiding misleading efficiency comparisons.')
+        else:lines.append('More history needed for a matched-session baseline.')
+    lines.append('COACHING NOTE')
+    if latest['drift'] is not None and latest['drift']>5:
+        lines.append('Second half >5% slower. Consider even-paced aerobic repeats with generous recovery; assess fatigue, technique and rests before changing intensity.')
+    elif latest['drift'] is not None and latest['drift']<-5:
+        lines.append('Second half >5% faster. Review pacing: a steadier first half may help on continuous swims.')
+    else:lines.append('Pacing looks reasonably consistent by recorded active-length times. Maintain technique and gradually build comparable sessions.')
+    lines.append('These are descriptive trends, not fatigue diagnoses. FIT active-length times exclude rest; pool size, drills and stroke type affect SWOLF.')
+    return '\n'.join(lines)[:3800]
+
 def garmin_recent():
     if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin not configured. Add GARMIN_PERSONAL_API_KEY in Vercel Production settings.'
     try:
@@ -599,12 +670,13 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — estimated 50m splits and HR\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
     extra=handle_v4(text,chat_id,cmd,parts)
     if extra is not None:return extra
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
+    if cmd=='/swimtrends':return swim_trends()
     if cmd=='/garminsync':return garmin_sync(5)
     if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
     if cmd=='/garmin':return garmin_recent()

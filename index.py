@@ -179,7 +179,7 @@ def garmin_backfill(reset=False):
     if st['status']=='complete':return garmin_backfill_status()
     token=garmin_token()
     offset=int(st['next_offset'])
-    page=garmin_api('/activitylist-service/activities/search/activities?'+urllib.parse.urlencode({'start':offset,'limit':20}),token)
+    page=garmin_api('/activitylist-service/activities/search/activities?'+urllib.parse.urlencode({'start':offset,'limit':10}),token)
     if not isinstance(page,list):raise ValueError('Unexpected Garmin history response')
     if not page:
         st.update(status='complete',last_error=None)
@@ -237,7 +237,7 @@ def garmin_backfill(reset=False):
     if error:
         st['failed_count']=int(st['failed_count'])+1
         st['status']='error';st['last_error']=error
-    elif finished or len(page)<20 and checked==len(page):
+    elif finished or len(page)<10 and checked==len(page):
         st['status']='complete';st['last_error']=None
     db('garmin_backfill_state','POST',st,'?on_conflict=chat_id')
     return garmin_backfill_status()

@@ -392,7 +392,7 @@ def swim_freestyle_progress():
                              'free_lengths':len(free),'all_lengths':len(lengths)})
         if len(page)<100:break
     if not sessions:
-        return '50M FREESTYLE PROGRESSION\\nNo sessions with at least four explicitly recorded freestyle lengths in a 50m pool. Check FIT stroke classifications.'
+        return '50M FREESTYLE PROGRESSION\nNo sessions with at least four explicitly recorded freestyle lengths in a 50m pool. Check FIT stroke classifications.'
     def pace(v):
         n=round(v);return str(n//60)+':'+str(n%60).zfill(2)+'/100m'
     def metric(xs,key):
@@ -425,7 +425,7 @@ def swim_freestyle_progress():
         lines.append('No closely matched earlier 50m freestyle sessions; showing trend without claiming an efficiency change.')
     lines.append('Only Garmin-classified freestyle lengths included. Drill/mixed/unknown strokes excluded. FIT labels can be imperfect.')
     lines.append('Active-length pace excludes rest. Interval intensity and push-offs still vary; earlier/later medians are descriptive, not proof of improvement.')
-    return '\\n'.join(lines)[:3800]
+    return '\n'.join(lines)[:3800]
 
 def garmin_recent():
     if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin not configured. Add GARMIN_PERSONAL_API_KEY in Vercel Production settings.'

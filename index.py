@@ -207,6 +207,78 @@ def swim_streams_diagnostic():
     lines.append('This checks stream availability, not Garmin pool-length boundaries, stroke counts or SWOLF.')
     return '\n'.join(lines)
 
+
+# v5.2: Strava stream-based estimated splits (not Garmin pool lengths).
+def swim_analysis():
+    rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=1&select=activity_id,name,activity_date,distance_m')
+    if not rows:return 'No swim found. Send /sync first.'
+    r=rows[0];token=strava_token()
+    if not token:return 'Strava is not connected. Send /connect.'
+    path='/api/v3/activities/'+urllib.parse.quote(str(r['activity_id']),safe='')+'/streams?'+urllib.parse.urlencode({'keys':'time,distance,heartrate','key_by_type':'true'})
+    try: streams=strava_api(path,token)
+    except urllib.error.HTTPError as exc:
+        if exc.code==429:return 'Strava rate limit reached. Try again later.'
+        return 'Could not retrieve swim streams (HTTP '+str(exc.code)+').'
+    except Exception:return 'Could not retrieve swim streams right now.'
+    if not isinstance(streams,dict):return 'No usable Strava stream data.'
+    t=(streams.get('time') or {}).get('data') or []
+    d=(streams.get('distance') or {}).get('data') or []
+    h=(streams.get('heartrate') or {}).get('data') or []
+    if len(t)<2 or len(t)!=len(d):return 'Time/distance streams are missing or misaligned.'
+    try:
+        samples=[(float(x),float(y)) for x,y in zip(t,d)]
+    except (TypeError,ValueError):return 'Streams contain nonnumeric samples.'
+    if any(samples[i][0]<=samples[i-1][0] or samples[i][1]<samples[i-1][1]-0.01 for i in range(1,len(samples))):
+        return 'Stream timing or distance is non-monotonic; refusing unreliable splits.'
+    total=samples[-1][1]-samples[0][1]
+    if total<50:return 'Not enough distance to estimate 50 m splits.'
+    # Interpolate time at each distance crossing; stationary distance includes rests.
+    crossings=[samples[0][0]];target=samples[0][1]+50;idx=1
+    while target<=samples[-1][1]+1e-6 and idx<len(samples):
+        while idx<len(samples) and samples[idx][1]<target:idx+=1
+        if idx>=len(samples):break
+        t0,d0=samples[idx-1];t1,d1=samples[idx]
+        if d1>d0:crossings.append(t0+(target-d0)*(t1-t0)/(d1-d0))
+        target+=50
+    if len(crossings)<2:return 'Unable to estimate any 50 m segments.'
+    durations=[crossings[i+1]-crossings[i] for i in range(len(crossings)-1)]
+    plausible=[30<=x<=180 for x in durations]
+    hrs=[]
+    for i in range(len(durations)):
+        vals=[float(h[j]) for j,(tm,_) in enumerate(samples) if j<len(h) and isinstance(h[j],(int,float)) and h[j]>0 and crossings[i]<=tm<crossings[i+1]]
+        hrs.append(round(statistics.mean(vals)) if vals else None)
+    lines=['SWIM ANALYSIS — '+str(r['activity_date']),str(r.get('name') or 'Swim'),
+           f'Estimated 50m segments: {len(durations)} | plausible durations: {sum(plausible)}/{len(plausible)}',
+           'Strava distance crossings are estimates, not Garmin pool lengths. Rest periods may be included.']
+    for i,(duration,ok,hr) in enumerate(zip(durations,plausible,hrs)):
+        if i>=12:break
+        pace=pace_per_100(duration,50) if ok else 'unreliable'
+        lines.append(f'{i+1:>2}. 50m · {pace} · HR {hr if hr is not None else "n/a"} bpm')
+    if len(durations)>12:lines.append(f'... {len(durations)-12} more segments not shown.')
+    if len(durations)>=20 and all(plausible[:10]) and all(plausible[-10:]):
+        first=sum(durations[:10]);last=sum(durations[-10:])
+        lines.append('First 500m: '+str(pace_per_100(first,500))+' | Last 500m: '+str(pace_per_100(last,500)))
+    else:lines.append('First/last 500m comparison withheld due to insufficient or implausible splits.')
+    lines.append('Stroke counts, SWOLF and exact turn boundaries require Garmin data.')
+    return '\n'.join(lines)
+
+# Explicit daily overrides are stored separately from the original schedule.
+def workout_override(chat,date):
+    rows=db('workout_overrides',query='?chat_id=eq.'+qchat(chat)+'&workout_date=eq.'+date.isoformat()+'&select=kind,name,details,reason&limit=1')
+    return rows[0] if rows else None
+
+def change_workout(chat,parts,reason=''):
+    if len(parts)<2:return 'Usage: /change gym a | /change gym b | /change swim | /change rest | /change reset'
+    choice=' '.join(parts[1:]).strip().lower()
+    if choice=='reset':
+        db('workout_overrides','DELETE',query='?chat_id=eq.'+qchat(chat)+'&workout_date=eq.'+today().isoformat())
+        return 'Today’s override cleared. /coach shows the original plan.'
+    options={'gym a':DAYS[1],'gym b':DAYS[4],'swim':DAYS[5],'rest':DAYS[2]}
+    if choice not in options:return 'Choose /change gym a, /change gym b, /change swim, /change rest or /change reset.'
+    name,kind,details=options[choice]
+    db('workout_overrides','POST',{'chat_id':str(chat),'workout_date':today().isoformat(),'kind':kind,'name':name,'details':details,'reason':reason[:300]},'?on_conflict=chat_id,workout_date')
+    return 'Today changed to '+name+'. Original schedule retained. Use /coach for the updated recommendation or /change reset to undo. This does not automatically reschedule a missed swim.'
+
 def swim_report():
     rows=db('strava_imports',query='?sport_type=eq.Swim&order=activity_date.desc&limit=5&select=name,activity_date,distance_m,swim_analysis')
     if not rows:return 'No imported swims yet. Send /sync first.'
@@ -265,6 +337,8 @@ def training_context(date):
 
 def recommend(date):
     week,name,kind,details,restriction=plan(date)
+    override=workout_override(env('TELEGRAM_CHAT_ID'),date)
+    if override:name,kind,details=override['name'],override['kind'],override['details']
     ctx=training_context(date)
     reasons=[];adjustment='Follow the scheduled session, adjusting effort to how you feel.'
     knee=ctx['knee']; score=knee.get('pain_score') if knee else None
@@ -291,12 +365,13 @@ def recommend(date):
         if ctx['gym']>=2:
             adjustment='Two gym sessions already recorded this week. Consider mobility or an easy recovery session instead.'
         reasons.append(f'{ctx["gym"]} / 2 gym sessions logged this week.')
+    if override:reasons.append('You changed today’s workout'+(': '+override['reason'] if override.get('reason') else '')+'.')
     safety=recovery_guidance(date,kind)
     if safety:
         adjustment=safety['adjustment'];reasons.extend(safety['reasons'])
     if not knee:reasons.append('No knee pain score logged yet; use /knee 0–10 to improve safety checks.')
     elif age is not None and age>3:reasons.append(f'Last knee score is {age} days old; log an updated score if symptoms changed.')
-    return {'week':week,'name':name,'kind':kind,'details':details,'restriction':restriction,'adjustment':adjustment,'reasons':reasons,'context':ctx}
+    return {'week':week,'name':name,'kind':kind,'details':details,'restriction':restriction,'adjustment':adjustment,'reasons':reasons,'context':ctx,'override':override}
 
 def coach_message(date):
     rec=recommend(date); ctx=rec['context']
@@ -324,11 +399,13 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — estimated 50m splits and HR\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
     extra=handle_v4(text,chat_id,cmd,parts)
     if extra is not None:return extra
-    if cmd=='/today': return message_today(today())
+    if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
+    if cmd=='/change':return change_workout(chat_id,parts)
+    if cmd=='/swimanalysis':return swim_analysis()
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'
     if cmd=='/connect':
@@ -376,6 +453,8 @@ def handle(text,chat_id):
         swim=sum((r.get('distance_m') or 0) for r in rows if r['kind']=='swim')
         gym=sum(1 for r in rows if r['kind']=='gym')
         return f'THIS WEEK\nSwim: {swim:,} / ~8,200 m\nGym: {gym} / 2 sessions\n\nBased on activities logged in Athlete OS. Strava activities are included after /sync or the daily scheduled import.'
+    if not text.startswith('/') and re.search(r'\b(?:can.t swim|cannot swim|pool (?:is )?closed|rather (?:do|go to) (?:the )?gym|switch to (?:the )?gym)\b',text.lower()):
+        return change_workout(chat_id,['/change','gym','a'],'Swim unavailable; requested gym')
     return natural_recovery(text,chat_id) if not text.startswith('/') else 'Unknown command. Try /help.'
 
 

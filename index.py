@@ -13,7 +13,7 @@ def req(url, payload=None, headers=None, method=None):
     with urllib.request.urlopen(urllib.request.Request(url,data=data,headers=h,method=method),timeout=12) as r: return json.loads(r.read() or b'{}')
 def db(table,method='GET',data=None,query=''):
     url=env('SUPABASE_URL').rstrip('/')+'/rest/v1/'+table+query
-    return req(url,data,{'apikey':env('SUPABASE_SERVICE_ROLE_KEY'),'Authorization':'Bearer '+env('SUPABASE_SERVICE_ROLE_KEY'),'Prefer':'return=representation,resolution=merge-duplicates' if table=='coaching_recommendations' and method=='POST' else 'return=representation'},method)
+    return req(url,data,{'apikey':env('SUPABASE_SERVICE_ROLE_KEY'),'Authorization':'Bearer '+env('SUPABASE_SERVICE_ROLE_KEY'),'Prefer':'return=representation,resolution=merge-duplicates' if table in ('coaching_recommendations','garmin_activities','garmin_swim_lengths','workout_overrides') and method=='POST' else 'return=representation'},method)
 def send(chat_id,message):
     return req('https://api.telegram.org/bot'+env('TELEGRAM_BOT_TOKEN')+'/sendMessage',{'chat_id':chat_id,'text':message[:3900]})
 
@@ -39,6 +39,146 @@ def garmin_api(path,token):
     if not path.startswith('/') or '://' in path:raise ValueError('Invalid Garmin API path')
     request=urllib.request.Request(GARMIN_BASE+path,headers={'Authorization':'Bearer '+token,'Accept':'application/json'})
     with urllib.request.urlopen(request,timeout=15) as response:return json.loads(response.read())
+
+
+# v5.4: Garmin is a read-only enrichment source; never insert Garmin duplicates into activities.
+def garmin_download_fit(activity_id, token):
+    import zipfile
+    if not str(activity_id).isdigit():raise ValueError('Invalid Garmin activity ID')
+    url=GARMIN_BASE+'/download-service/files/activity/'+str(activity_id)
+    request=urllib.request.Request(url,headers={'Authorization':'Bearer '+token,'Accept':'*/*'})
+    with urllib.request.urlopen(request,timeout=18) as response:
+        if response.headers.get('Content-Length') and int(response.headers['Content-Length'])>8_000_000:
+            raise ValueError('Garmin archive exceeds 8MB limit')
+        payload=response.read(8_000_001)
+    if len(payload)>8_000_000:raise ValueError('Garmin archive exceeds 8MB limit')
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        files=[info for info in archive.infolist() if info.filename.lower().endswith('.fit') and not info.is_dir()]
+        if len(files)!=1:raise ValueError('Expected exactly one FIT file')
+        if files[0].file_size>12_000_000:raise ValueError('FIT file exceeds size limit')
+        return archive.read(files[0])
+
+def garmin_parse_swim(fit_bytes):
+    from fitparse import FitFile
+    fit=FitFile(io.BytesIO(fit_bytes));fit.parse()
+    sessions=[{f.name:f.value for f in m} for m in fit.get_messages('session')]
+    session=sessions[0] if sessions else {}
+    pool=session.get('pool_length')
+    if not isinstance(pool,(int,float)) or not 10<=pool<=100:
+        raise ValueError('No valid pool length in FIT session')
+    result=[]
+    for msg in fit.get_messages('length'):
+        data={f.name:f.value for f in msg}
+        if str(data.get('length_type')).lower() in ('idle','1'):continue
+        seconds=data.get('total_timer_time')
+        if not isinstance(seconds,(int,float)) or not 3<=seconds<=600:continue
+        strokes=data.get('total_strokes')
+        if not isinstance(strokes,int) or strokes<0:strokes=None
+        hr=data.get('avg_heart_rate')
+        if not isinstance(hr,int) or not 30<=hr<=230:hr=None
+        result.append({'length_index':len(result)+1,'start_time':str(data.get('start_time') or ''),
+                       'distance_m':round(float(pool),2),'timer_s':round(float(seconds),3),
+                       'strokes':strokes,'stroke_type':str(data.get('swim_stroke') or ''),
+                       'avg_hr':hr})
+        if len(result)>1500:raise ValueError('Excessive FIT length count')
+    return result
+
+def garmin_match_strava(a,chat):
+    """Conservative matching: date + kind + close distance, unique candidate only.
+    Does not create or modify workout totals in public.activities."""
+    typ=((a.get('activityType') or {}).get('typeKey') or '').lower()
+    kind=('swim' if typ in ('lap_swimming','open_water_swimming') else
+          'gym' if typ=='strength_training' else
+          'run' if 'running' in typ else
+          'bike' if 'cycling' in typ else None)
+    if not kind:return None,'unmatched'
+    date=(a.get('startTimeLocal') or a.get('startTimeGMT') or '')[:10]
+    if not date:return None,'unmatched'
+    rows=db('strava_imports',query='?activity_date=eq.'+date+'&select=activity_id,sport_type,distance_m')
+    distance=a.get('distance')
+    candidates=[]
+    for row in rows:
+        sport=str(row.get('sport_type') or '').lower()
+        same=(kind=='swim' and sport=='swim') or (kind=='gym' and sport in ('weighttraining','workout','functionalstrengthtraining')) or (kind=='run' and 'run' in sport) or (kind=='bike' and ('ride' in sport or 'cycling' in sport))
+        if not same:continue
+        other=row.get('distance_m')
+        if kind in ('swim','run','bike') and isinstance(distance,(int,float)) and isinstance(other,(int,float)):
+            if abs(float(distance)-float(other))>max(30,0.03*float(distance)):continue
+        candidates.append(str(row['activity_id']))
+    if len(candidates)==1:return candidates[0],'matched'
+    return None,'ambiguous' if len(candidates)>1 else 'unmatched'
+
+def garmin_sync(limit=10):
+    if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin key missing.'
+    token=garmin_token()
+    items=garmin_api('/activitylist-service/activities/search/activities?'+urllib.parse.urlencode({'start':0,'limit':limit}),token)
+    if not isinstance(items,list):raise ValueError('Garmin activities response was not a list')
+    seen=0;new=0;swims=0;skipped=0;errors=[]
+    chat=env('TELEGRAM_CHAT_ID')
+    for a in items:
+        aid=a.get('activityId')
+        if not isinstance(aid,int) or aid<=0:continue
+        seen+=1
+        old=db('garmin_activities',query='?activity_id=eq.'+str(aid)+'&select=activity_id,swim_length_count')
+        if old and (old[0].get('swim_length_count') or 0)>0:skipped+=1;continue
+        typ=((a.get('activityType') or {}).get('typeKey') or 'unknown')
+        date=(a.get('startTimeLocal') or a.get('startTimeGMT') or '')[:10]
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',date):continue
+        match,status=garmin_match_strava(a,chat)
+        row={'activity_id':aid,'chat_id':chat,'activity_date':date,'start_time_local':str(a.get('startTimeLocal') or '')[:40],
+             'activity_type':typ,'name':str(a.get('activityName') or '')[:200],
+             'distance_m':a.get('distance'),'duration_s':a.get('duration'),
+             'strava_activity_id':match,'match_status':status}
+        if not old:
+            db('garmin_activities','POST',row,'?on_conflict=activity_id');new+=1
+        else:
+            db('garmin_activities','PATCH',row,'?activity_id=eq.'+str(aid))
+        if typ!='lap_swimming':continue
+        try:
+            lengths=garmin_parse_swim(garmin_download_fit(aid,token))
+            if not lengths:raise ValueError('No active pool lengths')
+            for i in range(0,len(lengths),100):
+                chunk=[{'activity_id':aid,**length} for length in lengths[i:i+100]]
+                db('garmin_swim_lengths','POST',chunk,'?on_conflict=activity_id,length_index')
+            db('garmin_activities','PATCH',{'swim_length_count':len(lengths)},'?activity_id=eq.'+str(aid))
+            swims+=1
+        except Exception as exc:
+            print('Garmin FIT import error',aid,type(exc).__name__)
+            errors.append(str(aid))
+    return f'GARMIN SYNC: {seen} checked, {new} new metadata records, {swims} swims with FIT lengths, {skipped} already imported.'+((' FIT import failed for IDs: '+', '.join(errors[:5])) if errors else '')+'\nGarmin enriches Strava workouts; it does not add duplicate workout totals.'
+
+def garmin_swim_report():
+    rows=db('garmin_activities',query='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&order=activity_date.desc,start_time_local.desc&limit=1&select=activity_id,activity_date,name,swim_length_count,strava_activity_id,match_status')
+    if not rows:return None
+    a=rows[0];aid=a['activity_id']
+    lengths=db('garmin_swim_lengths',query='?activity_id=eq.'+str(aid)+'&order=length_index.asc&select=length_index,distance_m,timer_s,strokes,avg_hr')
+    if not lengths:return None
+    total=sum(float(x['distance_m']) for x in lengths)
+    timer=sum(float(x['timer_s']) for x in lengths)
+    counts=[int(x['strokes']) for x in lengths if x.get('strokes') is not None]
+    times=[float(x['timer_s']) for x in lengths]
+    pace=pace_per_100(timer,total)
+    lines=['GARMIN SWIM ANALYSIS — '+str(a['activity_date']),str(a['name']),
+           f'{total:g}m | {len(lengths)} actual pool lengths | swim timer {int(timer//60)}:{int(round(timer%60)):02d} | {pace}',
+           'Garmin original FIT length records (not estimated Strava crossings).']
+    if counts:
+        lines.append(f'Strokes: {sum(counts)} total; {statistics.mean(counts):.1f}/length; range {min(counts)}–{max(counts)}')
+        swolf=[float(x['timer_s'])+int(x['strokes']) for x in lengths if x.get('strokes') is not None]
+        lines.append(f'Calculated SWOLF: {statistics.mean(swolf):.1f} (length seconds + recorded strokes)')
+    lines.append('500M BLOCKS')
+    for start in range(0,len(lengths),1):
+        if start and sum(float(x['distance_m']) for x in lengths[:start])%500!=0:continue
+        segment=[];metres=0
+        for x in lengths[start:]:
+            if metres>=500:break
+            segment.append(x);metres+=float(x['distance_m'])
+        if abs(metres-500)>0.1:continue
+        secs=sum(float(x['timer_s']) for x in segment)
+        strokes=[int(x['strokes']) for x in segment if x.get('strokes') is not None]
+        lines.append(f'{int(sum(float(x["distance_m"]) for x in lengths[:start]))}–{int(sum(float(x["distance_m"]) for x in lengths[:start])+500)}m: {pace_per_100(secs,500)}; strokes/length {statistics.mean(strokes):.1f}' if strokes else f'{start}: {pace_per_100(secs,500)}')
+    lines.append(f'Strava match: {a["match_status"]}'+(f' (ID {a["strava_activity_id"]})' if a.get('strava_activity_id') else ''))
+    lines.append('FIT stroke counts and length times depend on watch recording accuracy.')
+    return '\n'.join(lines)
 
 def garmin_recent():
     if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin not configured. Add GARMIN_PERSONAL_API_KEY in Vercel Production settings.'
@@ -465,7 +605,7 @@ def handle(text,chat_id):
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
-    if cmd=='/swimanalysis':return swim_analysis()
+    if cmd=='/garminsync':return garmin_sync()\n    if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
     if cmd=='/garmin':return garmin_recent()
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'
@@ -722,6 +862,9 @@ class handler(BaseHTTPRequestHandler):
         try:
             sync_strava()
         except Exception as e: print('Scheduled Strava sync failed',type(e).__name__)
+        try:
+            if env('GARMIN_PERSONAL_API_KEY'): garmin_sync(10)
+        except Exception as e: print('Scheduled Garmin sync failed',type(e).__name__)
         date=today(); key='daily:'+date.isoformat()
         prior=db('notifications',query='?notification_key=eq.'+key+'&select=id')
         if prior: return self.reply(200,{'ok':True,'status':'already sent'})

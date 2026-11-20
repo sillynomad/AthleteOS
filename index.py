@@ -277,79 +277,90 @@ def garmin_swim_report():
     return '\n'.join(lines)
 
 
-# v5.5: Read-only longitudinal Garmin pool swim coaching. No new tables required.
-def swim_history(max_swims=12):
-    q='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&order=activity_date.desc,start_time_local.desc&limit='+str(max_swims)+'&select=activity_id,activity_date,name,swim_length_count'
-    rows=db('garmin_activities',query=q) or []
+# Garmin 90-day, pool-specific swim trends. Read-only; existing FIT lengths are reused.
+def swim_history(max_swims=200):
+    cutoff=(datetime.datetime.now(TZ).date()-datetime.timedelta(days=90)).isoformat()
+    base='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&activity_date=gte.'+cutoff+'&order=activity_date.desc,start_time_local.desc&select=activity_id,activity_date,name,swim_length_count'
     history=[]
-    for a in rows:
-        lengths=db('garmin_swim_lengths',query='?activity_id=eq.'+str(a['activity_id'])+'&order=length_index.asc&select=distance_m,timer_s,strokes,avg_hr') or []
-        if not lengths:continue
-        total=sum(float(x['distance_m']) for x in lengths)
-        secs=sum(float(x['timer_s']) for x in lengths)
-        if total<=0 or secs<=0:continue
-        strokes=[x for x in lengths if isinstance(x.get('strokes'),int)]
-        stroke_rate=(sum(x['strokes'] for x in strokes)/len(strokes)) if strokes else None
-        swolf=(sum(float(x['timer_s'])+x['strokes'] for x in strokes)/len(strokes)) if strokes else None
-        half=total/2;covered=0;first=[];second=[]
-        for x in lengths:
-            mid=covered+float(x['distance_m'])/2
-            (first if mid<=half else second).append(x)
-            covered+=float(x['distance_m'])
-        def segment_pace(group):
-            dist=sum(float(x['distance_m']) for x in group)
-            return sum(float(x['timer_s']) for x in group)*100/dist if dist else None
-        first_pace=segment_pace(first);last_pace=segment_pace(second)
-        drift=(last_pace-first_pace)/first_pace*100 if first_pace and last_pace else None
-        history.append({'id':a['activity_id'],'date':a['activity_date'],'distance':total,'seconds':secs,
-                        'pace':secs*100/total,'stroke':stroke_rate,'swolf':swolf,'drift':drift,
-                        'lengths':len(lengths),'pool_m':round(total/len(lengths),2)})
+    # Page through all matching swims, rather than silently using only the latest 12.
+    for offset in range(0,max_swims,100):
+        rows=db('garmin_activities',query=base+'&limit='+str(min(100,max_swims-offset))+'&offset='+str(offset)) or []
+        for a in rows:
+            lengths=db('garmin_swim_lengths',query='?activity_id=eq.'+str(a['activity_id'])+'&order=length_index.asc&select=distance_m,timer_s,strokes,avg_hr,stroke_type') or []
+            if not lengths:continue
+            total=sum(float(x['distance_m']) for x in lengths)
+            secs=sum(float(x['timer_s']) for x in lengths)
+            if total<=0 or secs<=0:continue
+            pool_m=round(total/len(lengths),2)
+            if any(abs(float(x['distance_m'])-pool_m)>0.1 for x in lengths):continue
+            valid=[x for x in lengths if isinstance(x.get('strokes'),int) and x['strokes']>=0]
+            stroke=sum(x['strokes'] for x in valid)/len(valid) if valid else None
+            swolf=sum(float(x['timer_s'])+x['strokes'] for x in valid)/len(valid) if valid else None
+            # Exclude sessions with multiple recorded strokes from strict efficiency matching.
+            types={str(x.get('stroke_type') or '').lower() for x in lengths if x.get('stroke_type')}
+            half=total/2;covered=0;first=[];second=[]
+            for x in lengths:
+                mid=covered+float(x['distance_m'])/2
+                (first if mid<=half else second).append(x)
+                covered+=float(x['distance_m'])
+            def segment_pace(group):
+                dist=sum(float(x['distance_m']) for x in group)
+                return sum(float(x['timer_s']) for x in group)*100/dist if dist else None
+            p1=segment_pace(first);p2=segment_pace(second)
+            drift=(p2-p1)/p1*100 if p1 and p2 else None
+            history.append({'id':a['activity_id'],'date':a['activity_date'],'distance':total,
+                            'pace':secs*100/total,'stroke':stroke,'swolf':swolf,'drift':drift,
+                            'pool_m':pool_m,'stroke_types':types})
+        if len(rows)<min(100,max_swims-offset):break
     return history
 
 def swim_trends():
     history=swim_history()
-    if not history:return 'No Garmin pool lengths found. Run /garminsync first.'
+    if not history:return 'No Garmin FIT pool swims in the last 90 days. Check /garminbackfillstatus.'
     latest=history[0]
     def pace_str(v):
         n=round(v)
         return str(n//60)+':'+str(n%60).zfill(2)+'/100m'
-    def fmt(v,unit=''):
-        return f'{v:.1f}{unit}' if v is not None else 'n/a'
-    lines=['SWIM TRENDS — Garmin FIT','Imported pool swims: '+str(len(history))+' (up to 12 most recent)',
+    def fmt(v):
+        return f'{v:.1f}' if v is not None else 'n/a'
+    def median_metric(group,key):
+        values=[x[key] for x in group if x[key] is not None]
+        return statistics.median(values) if values else None
+    lines=['SWIM TRENDS — Garmin FIT (last 90 days)',
+           'Imported pool swims analysed: '+str(len(history)),
+           'Primary benchmark: 50m pool',
            'LATEST: '+str(latest['date'])+' | '+str(round(latest['distance']))+'m | '+str(latest['pool_m'])+'m pool | '+pace_str(latest['pace']),
-           'Strokes/length '+fmt(latest['stroke'])+' | SWOLF '+fmt(latest['swolf'])+
-           ' | second-half pace change '+fmt(latest['drift'],'%')]
-    if len(history)<3:
-        lines.append('Baseline building: at least 3 pool swims needed for trends. These are not enough to establish improvement.')
-    else:
-        recent=history[:min(4,len(history))]
-        older=history[min(4,len(history)):]
-        lines.append('RECENT SESSIONS')
-        for x in recent:
-            lines.append(str(x['date'])+' '+str(round(x['distance']))+'m | '+str(x['pool_m'])+'m pool | '+pace_str(x['pace'])+' | strokes '+fmt(x['stroke'])+' | SWOLF '+fmt(x['swolf']))
-        if older:
-            # Compare at similar paces and same pool length, to reduce misleading SWOLF comparisons.
-            similar=[x for x in older if abs(x['pace']-latest['pace'])/latest['pace']<=0.05 and
-                     abs(x['distance']-latest['distance'])/latest['distance']<=0.25 and x['pool_m']==latest['pool_m'] and x['stroke'] is not None]
-            if similar and latest['stroke'] is not None:
-                baseline=statistics.median(x['stroke'] for x in similar)
-                lines.append('MATCHED-SESSION BENCHMARK ('+str(len(similar))+' older swim(s), same pool length, pace within 5%, distance within 25%):')
-                lines.append('Strokes/length '+fmt(latest['stroke'])+' vs baseline '+fmt(baseline)+
-                             ' ('+fmt(latest['stroke']-baseline,' strokes')+'). Lower may indicate more distance per stroke at similar pace.')
-            else:lines.append('No comparable older swims yet (same pool length, pace ±5%, distance ±25%); avoiding misleading efficiency comparisons.')
-        else:lines.append('More history needed for a matched-session baseline.')
-    pool_sizes=sorted(set(x['pool_m'] for x in history))
-    if len(pool_sizes)>1:
-        lines.append('POOL-AWARE INTERPRETATION')
-        lines.append('25m and 50m pool strokes/length and raw SWOLF are NOT directly comparable; longer lengths naturally increase both. Efficiency benchmarks use only matching pool lengths.')
-        lines.append('Pace/100m is shown across pools, but extra turns can affect speed. Do not interpret a cross-pool pace difference as a fitness change.')
+           'Strokes/length '+fmt(latest['stroke'])+' | SWOLF '+fmt(latest['swolf'])+' | second-half pace change '+fmt(latest['drift'])+'%']
+    lines.append('POOL-SPECIFIC BASELINES (session medians; active swim time)')
+    for pool in [50.0,25.0]+sorted({x['pool_m'] for x in history}-{50.0,25.0}):
+        group=[x for x in history if x['pool_m']==pool]
+        if not group:continue
+        lines.append(f'{pool:g}m pool: {len(group)} swims | pace {pace_str(statistics.median(x["pace"] for x in group))} | strokes/length {fmt(median_metric(group,"stroke"))} | SWOLF {fmt(median_metric(group,"swolf"))}')
+    lines.append('RECENT SESSIONS')
+    for x in history[:4]:
+        lines.append(str(x['date'])+' '+str(round(x['distance']))+'m | '+str(x['pool_m'])+'m pool | '+pace_str(x['pace'])+' | strokes '+fmt(x['stroke'])+' | SWOLF '+fmt(x['swolf']))
+    # Prefer latest 50m workout as the primary performance benchmark.
+    target=next((x for x in history if x['pool_m']==50.0),None)
+    if target:
+        candidates=[x for x in history if x['id']!=target['id'] and x['pool_m']==50.0
+                    and abs(x['distance']-target['distance'])/target['distance']<=0.25
+                    and abs(x['pace']-target['pace'])/target['pace']<=0.05
+                    and x['stroke_types']==target['stroke_types']]
+        if candidates:
+            lines.append('50M MATCHED COMPARISON — '+str(target['date'])+' vs '+str(len(candidates))+' similar 50m swims')
+            lines.append('Pace '+pace_str(target['pace'])+' vs '+pace_str(statistics.median(x['pace'] for x in candidates)))
+            if target['stroke'] is not None and median_metric(candidates,'stroke') is not None:
+                lines.append('Strokes/length '+fmt(target['stroke'])+' vs '+fmt(median_metric(candidates,'stroke')))
+            if target['swolf'] is not None and median_metric(candidates,'swolf') is not None:
+                lines.append('SWOLF '+fmt(target['swolf'])+' vs '+fmt(median_metric(candidates,'swolf')))
+        else:
+            lines.append('50M MATCHED COMPARISON: no other swims within 25% distance and 5% pace with matching recorded stroke types.')
+    else:lines.append('50M MATCHED COMPARISON: no 50m pool swims imported yet.')
+    if latest['pool_m']!=50.0:
+        lines.append('Latest workout is in a '+str(latest['pool_m'])+'m pool; 50m history remains the primary benchmark.')
     lines.append('COACHING NOTE')
-    if latest['drift'] is not None and latest['drift']>5:
-        lines.append('Second half >5% slower. Consider even-paced aerobic repeats with generous recovery; assess fatigue, technique and rests before changing intensity.')
-    elif latest['drift'] is not None and latest['drift']<-5:
-        lines.append('Second half >5% faster. Review pacing: a steadier first half may help on continuous swims.')
-    else:lines.append('Pacing looks reasonably consistent by recorded active-length times. Maintain technique and gradually build comparable sessions.')
-    lines.append('Pool size inferred from FIT length distances (Garmin session pool setting). Descriptive only: active-length times exclude rest; drills and stroke type affect efficiency metrics.')
+    lines.append('Use the 50m baseline to monitor long-term efficiency; treat 25m results separately. Medians include mixed workout structures and are descriptive, not proof of fitness change.')
+    lines.append('FIT active-length times exclude rests. Turns, drills, stroke type and interval intensity affect pace, stroke counts and SWOLF.')
     return '\n'.join(lines)[:3800]
 
 def garmin_recent():

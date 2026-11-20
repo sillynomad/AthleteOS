@@ -13,7 +13,7 @@ def req(url, payload=None, headers=None, method=None):
     with urllib.request.urlopen(urllib.request.Request(url,data=data,headers=h,method=method),timeout=12) as r: return json.loads(r.read() or b'{}')
 def db(table,method='GET',data=None,query=''):
     url=env('SUPABASE_URL').rstrip('/')+'/rest/v1/'+table+query
-    return req(url,data,{'apikey':env('SUPABASE_SERVICE_ROLE_KEY'),'Authorization':'Bearer '+env('SUPABASE_SERVICE_ROLE_KEY'),'Prefer':'return=representation,resolution=merge-duplicates' if table in ('coaching_recommendations','garmin_activities','garmin_swim_lengths','workout_overrides') and method=='POST' else 'return=representation'},method)
+    return req(url,data,{'apikey':env('SUPABASE_SERVICE_ROLE_KEY'),'Authorization':'Bearer '+env('SUPABASE_SERVICE_ROLE_KEY'),'Prefer':'return=representation,resolution=merge-duplicates' if table in ('coaching_recommendations','garmin_activities','garmin_swim_lengths','garmin_backfill_state','workout_overrides') and method=='POST' else 'return=representation'},method)
 def send(chat_id,message):
     return req('https://api.telegram.org/bot'+env('TELEGRAM_BOT_TOKEN')+'/sendMessage',{'chat_id':chat_id,'text':message[:3900]})
 
@@ -146,6 +146,101 @@ def garmin_sync(limit=10):
             print('Garmin FIT import error',aid,type(exc).__name__)
             errors.append(str(aid))
     return f'GARMIN SYNC: {seen} checked, {new} new metadata records, {swims} swims with FIT lengths, {skipped} already imported.'+((' FIT import failed for IDs: '+', '.join(errors[:5])) if errors else '')+'\nGarmin enriches Strava workouts; it does not add duplicate workout totals.'
+
+
+# v5.6: bounded, resumable 90-day historical pool swim import.
+# Garmin listing is newest-first; cursor advances only after successful processing.
+def garmin_backfill_state():
+    rows=db('garmin_backfill_state',query='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&select=*')
+    return rows[0] if rows else None
+
+def garmin_backfill_status():
+    st=garmin_backfill_state()
+    if not st:return 'No historical Garmin backfill started. Send /garminbackfill to begin a 90-day pool swim import.'
+    return ('GARMIN 90-DAY BACKFILL — '+str(st['status']).upper()+
+            '\nCutoff: '+str(st['cutoff_date'])+
+            '\nActivities scanned: '+str(st['scanned'])+
+            '\nNew swims imported: '+str(st['swims_imported'])+
+            '\nExisting swims skipped: '+str(st['swims_existing'])+
+            '\nFailed imports: '+str(st['failed_count'])+
+            '\nNext Garmin offset: '+str(st['next_offset'])+
+            ('\nLast error: '+str(st['last_error'])[:120] if st.get('last_error') else '')+
+            ('\nSend /garminbackfill again to continue.' if st['status']!='complete' else '\nHistorical scan complete. Send /swimtrends for analysis.'))
+
+def garmin_backfill(reset=False):
+    if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin key missing.'
+    chat=env('TELEGRAM_CHAT_ID')
+    st=garmin_backfill_state()
+    if reset or not st:
+        cutoff=(datetime.datetime.now(TZ).date()-datetime.timedelta(days=90)).isoformat()
+        st={'chat_id':chat,'cutoff_date':cutoff,'next_offset':0,'scanned':0,
+            'swims_imported':0,'swims_existing':0,'failed_count':0,'status':'running','last_error':None}
+        db('garmin_backfill_state','POST',st,'?on_conflict=chat_id')
+    if st['status']=='complete':return garmin_backfill_status()
+    token=garmin_token()
+    offset=int(st['next_offset'])
+    page=garmin_api('/activitylist-service/activities/search/activities?'+urllib.parse.urlencode({'start':offset,'limit':10}),token)
+    if not isinstance(page,list):raise ValueError('Unexpected Garmin history response')
+    if not page:
+        st.update(status='complete',last_error=None)
+        db('garmin_backfill_state','POST',st,'?on_conflict=chat_id')
+        return garmin_backfill_status()
+    checked=0;imported=0;existing=0;error=None;finished=False
+    for a in page:
+        # The activity list is expected newest-first. Stop once outside 90-day window.
+        date=str(a.get('startTimeLocal') or a.get('startTimeGMT') or '')[:10]
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',date):
+            error='Missing Garmin activity date';break
+        if date<str(st['cutoff_date']):
+            finished=True;break
+        aid=a.get('activityId')
+        if not isinstance(aid,int) or aid<=0:
+            error='Invalid Garmin activity ID';break
+        typ=(a.get('activityType') or {}).get('typeKey') or 'unknown'
+        if typ=='lap_swimming':
+            try:
+                prior=db('garmin_activities',query='?activity_id=eq.'+str(aid)+'&select=activity_id,swim_length_count')
+                if prior and int(prior[0].get('swim_length_count') or 0)>0:
+                    existing+=1
+                else:
+                    lengths=garmin_parse_swim(garmin_download_fit(aid,token))
+                    if not lengths:raise ValueError('No active pool lengths')
+                    match,status=garmin_match_strava(a,chat)
+                    row={'activity_id':aid,'chat_id':chat,'activity_date':date,
+                         'start_time_local':str(a.get('startTimeLocal') or '')[:40],
+                         'activity_type':typ,'name':str(a.get('activityName') or '')[:200],
+                         'distance_m':a.get('distance'),'duration_s':a.get('duration'),
+                         'strava_activity_id':match,'match_status':status,'swim_length_count':0}
+                    db('garmin_activities','POST',row,'?on_conflict=activity_id')
+                    for j in range(0,len(lengths),100):
+                        db('garmin_swim_lengths','POST',
+                           [{'activity_id':aid,**length} for length in lengths[j:j+100]],
+                           '?on_conflict=activity_id,length_index')
+                    db('garmin_activities','PATCH',{'swim_length_count':len(lengths)},
+                       '?activity_id=eq.'+str(aid))
+                    imported+=1
+            except Exception as exc:
+                print('Garmin backfill FIT failed',aid,type(exc).__name__)
+                error='FIT import failed for activity '+str(aid)+' ('+type(exc).__name__+')'
+                break
+        checked+=1
+        st['next_offset']=offset+checked
+        st['scanned']=int(st['scanned'])+1
+        st['swims_imported']=int(st['swims_imported'])+imported
+        st['swims_existing']=int(st['swims_existing'])+existing
+        imported=0;existing=0
+        st['status']='running';st['last_error']=None
+        db('garmin_backfill_state','POST',st,'?on_conflict=chat_id')
+        # One new FIT per request protects the 30-second Vercel function limit.
+        if typ=='lap_swimming' and not (prior and int(prior[0].get('swim_length_count') or 0)>0):
+            break
+    if error:
+        st['failed_count']=int(st['failed_count'])+1
+        st['status']='error';st['last_error']=error
+    elif finished or len(page)<10 and checked==len(page):
+        st['status']='complete';st['last_error']=None
+    db('garmin_backfill_state','POST',st,'?on_conflict=chat_id')
+    return garmin_backfill_status()
 
 def garmin_swim_report():
     rows=db('garmin_activities',query='?chat_id=eq.'+urllib.parse.quote(env('TELEGRAM_CHAT_ID'))+'&activity_type=eq.lap_swimming&swim_length_count=gt.0&order=activity_date.desc,start_time_local.desc&limit=1&select=activity_id,activity_date,name,swim_length_count,strava_activity_id,match_status')
@@ -670,12 +765,14 @@ def daily_coach(date):
 def handle(text,chat_id):
     text=(text or '').strip(); parts=text.split(); cmd=parts[0].split('@')[0].lower() if parts else ''
     if cmd in ('/start','/help'):
-        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
+        return 'Athlete OS 🦄\n/today — prescribed workout\n/plan — weekly schedule\n/progress — this week\n/weight 74.8 — log weight\n/knee 0 — pain score 0–10\n/done swim 2800 — log completed swim\n/done gym — log completed gym\n/sync — import Strava workouts\n/swims — analyze recent swim sets\n/swimdetail — latest swim laps, pace and HR\n/swimstreams — check Strava stream resolution\n/swimanalysis — Garmin FIT swim metrics (Strava fallback)\n/swimtrends — Garmin efficiency and pacing trends\n/garminbackfill — import 90 days of Garmin swims (repeat to continue)\n/garminbackfillstatus — show backfill progress\n/change gym a | gym b | swim | rest | reset — override today\n/coach — adaptive recommendation + progress bars\n/connect — authorize Strava\n/checkin fatigue 3 sleep 7 knee 1 achilles 0 — recovery\n/waist 82 — waist in cm\n/trend — weight and waist trend\n/compare — planned vs actual\n/dashboard — weekly PNG\n/runstatus — return-to-run status\n/clearance yes — record clinician clearance\n/clearance no — revoke clearance\n/help — commands'
     extra=handle_v4(text,chat_id,cmd,parts)
     if extra is not None:return extra
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
+    if cmd=='/garminbackfillstatus':return garmin_backfill_status()
+    if cmd=='/garminbackfill':return garmin_backfill(reset=len(parts)>1 and parts[1].lower()=='reset')
     if cmd=='/swimtrends':return swim_trends()
     if cmd=='/garminsync':return garmin_sync(5)
     if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()

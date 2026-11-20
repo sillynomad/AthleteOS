@@ -15,6 +15,11 @@ def extract(path):
     from fitparse import FitFile
     fit = FitFile(str(path))
     fit.parse()
+    sessions = list(fit.get_messages("session"))
+    pool_length = None
+    if sessions:
+        session = {field.name: field.value for field in sessions[0]}
+        pool_length = session.get("pool_length")
     lengths = []
     for msg in fit.get_messages("length"):
         data = {field.name: field.value for field in msg}
@@ -22,7 +27,8 @@ def extract(path):
             continue
         duration = data.get("total_timer_time") or data.get("total_elapsed_time")
         strokes = data.get("total_strokes")
-        distance = data.get("total_distance")
+        # FIT length messages normally do not contain total_distance; pool length is in session.
+        distance = data.get("total_distance") or pool_length
         if not isinstance(distance, (float, int)) or distance <= 0:
             continue
         if not isinstance(duration, (float, int)) or duration <= 0:

@@ -51,9 +51,9 @@ def garmin_recent():
         for a in data:
             typ=a.get('activityType') or {}
             typ=typ.get('typeKey','unknown') if isinstance(typ,dict) else str(typ)
-            name=str(a.get('activityName') or 'Activity').replace('\\n',' ')[:65]
+            name=str(a.get('activityName') or 'Activity').replace('\n',' ')[:65]
             lines.append(str(a.get('startTimeLocal') or a.get('startTimeGMT') or 'Unknown date')[:16]+' · '+name+' · '+typ+' · ID '+str(a.get('activityId')))
-        return '\\n'.join(lines) if data else 'Garmin connected. No activities returned.'
+        return '\n'.join(lines) if data else 'Garmin connected. No activities returned.'
     except urllib.error.HTTPError as exc:
         print('Garmin API HTTP error',exc.code)
         return 'Garmin connection failed (HTTP '+str(exc.code)+'). Check the API key and Vercel logs.'
@@ -465,7 +465,8 @@ def handle(text,chat_id):
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
-    if cmd=='/swimanalysis':return swim_analysis()\n    if cmd=='/garmin':return garmin_recent()
+    if cmd=='/swimanalysis':return swim_analysis()
+    if cmd=='/garmin':return garmin_recent()
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'
     if cmd=='/connect':

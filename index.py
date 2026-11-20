@@ -586,10 +586,10 @@ def strava_notes_audit():
     blank=sum(i in lookup and not str(lookup[i].get('description') or '').strip() for i in ids)
     absent=sum(i not in lookup for i in ids)
     unmatched=len(garmin)-len(ids)
-    return ('STRAVA DESCRIPTION AUDIT (90 days)\\n'+
-            f'Garmin swims: {len(garmin)} | matched: {len(ids)} | with notes: {populated}\\n'+
-            f'Stored empty descriptions: {blank} | missing Strava records: {absent} | unmatched Garmin swims: {unmatched}\\n'+
-            'Run /sync to re-fetch empty descriptions from Strava; existing nonempty notes are preserved.\\n'+
+    return ('STRAVA DESCRIPTION AUDIT (90 days)\n'+
+            f'Garmin swims: {len(garmin)} | matched: {len(ids)} | with notes: {populated}\n'+
+            f'Stored empty descriptions: {blank} | missing Strava records: {absent} | unmatched Garmin swims: {unmatched}\n'+
+            'Run /sync to re-fetch empty descriptions from Strava; existing nonempty notes are preserved.\n'+
             'This audit checks stored data, not whether descriptions exist on Strava.')
  
 def sync_strava():

@@ -605,7 +605,8 @@ def handle(text,chat_id):
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
-    if cmd=='/garminsync':return garmin_sync()\n    if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
+    if cmd=='/garminsync':return garmin_sync()
+    if cmd=='/swimanalysis':return garmin_swim_report() or swim_analysis()
     if cmd=='/garmin':return garmin_recent()
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'

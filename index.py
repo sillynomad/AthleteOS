@@ -17,6 +17,50 @@ def db(table,method='GET',data=None,query=''):
 def send(chat_id,message):
     return req('https://api.telegram.org/bot'+env('TELEGRAM_BOT_TOKEN')+'/sendMessage',{'chat_id':chat_id,'text':message[:3900]})
 
+# Garmin Connect Personal API (read-only, single-user).
+GARMIN_BASE='https://personal.connectapi.garmin.com'
+def garmin_token():
+    key=env('GARMIN_PERSONAL_API_KEY').strip()
+    if not key:return None
+    request=urllib.request.Request(
+        GARMIN_BASE+'/personalapitoken-service/personal-api/personal-api-key/token',
+        data=b'',method='POST',
+        headers={'Authorization':'ApiKey '+key,'Accept':'*/*'})
+    with urllib.request.urlopen(request,timeout=12) as response:
+        raw=response.read().decode('utf-8').strip()
+    # Garmin returns a plain bearer token; some clients may wrap it in JSON.
+    if raw.startswith('{'):
+        obj=json.loads(raw)
+        raw=obj.get('access_token') or obj.get('token') or ''
+    if not raw or len(raw)>8192:raise ValueError('Invalid Garmin token response')
+    return raw
+
+def garmin_api(path,token):
+    if not path.startswith('/') or '://' in path:raise ValueError('Invalid Garmin API path')
+    request=urllib.request.Request(GARMIN_BASE+path,headers={'Authorization':'Bearer '+token,'Accept':'application/json'})
+    with urllib.request.urlopen(request,timeout=15) as response:return json.loads(response.read())
+
+def garmin_recent():
+    if not env('GARMIN_PERSONAL_API_KEY'):return 'Garmin not configured. Add GARMIN_PERSONAL_API_KEY in Vercel Production settings.'
+    try:
+        token=garmin_token()
+        path='/activitylist-service/activities/search/activities?'+urllib.parse.urlencode({'start':0,'limit':5})
+        data=garmin_api(path,token)
+        if not isinstance(data,list):return 'Garmin connected, but activity list format was unexpected.'
+        lines=['GARMIN CONNECTED — latest activities']
+        for a in data:
+            typ=a.get('activityType') or {}
+            typ=typ.get('typeKey','unknown') if isinstance(typ,dict) else str(typ)
+            name=str(a.get('activityName') or 'Activity').replace('\\n',' ')[:65]
+            lines.append(str(a.get('startTimeLocal') or a.get('startTimeGMT') or 'Unknown date')[:16]+' · '+name+' · '+typ+' · ID '+str(a.get('activityId')))
+        return '\\n'.join(lines) if data else 'Garmin connected. No activities returned.'
+    except urllib.error.HTTPError as exc:
+        print('Garmin API HTTP error',exc.code)
+        return 'Garmin connection failed (HTTP '+str(exc.code)+'). Check the API key and Vercel logs.'
+    except Exception as exc:
+        print('Garmin connection failed',type(exc).__name__)
+        return 'Garmin connection test failed. Check Vercel logs.'
+
 # Strava single-user OAuth and scheduled import. Tokens remain server-side in Supabase.
 BASE='https://www.strava.com'
 def strava_api(path, token=None, payload=None):
@@ -421,7 +465,7 @@ def handle(text,chat_id):
     if cmd=='/today': return coach_message(today())
     if cmd=='/coach': return daily_coach(today())
     if cmd=='/change':return change_workout(chat_id,parts)
-    if cmd=='/swimanalysis':return swim_analysis()
+    if cmd=='/swimanalysis':return swim_analysis()\n    if cmd=='/garmin':return garmin_recent()
     if cmd=='/plan':
         return 'WEEKLY PLAN\n'+'\n'.join(f'{i+1}. {x[0]}' for i,x in enumerate(DAYS))+'\n\nWeeks 1–3: no hard running, cycling or heavy leg training.'
     if cmd=='/connect':

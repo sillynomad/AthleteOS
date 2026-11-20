@@ -253,8 +253,9 @@ def garmin_swim_report():
     counts=[int(x['strokes']) for x in lengths if x.get('strokes') is not None]
     times=[float(x['timer_s']) for x in lengths]
     pace=pace_per_100(timer,total)
+    pool_m=round(total/len(lengths),2)
     lines=['GARMIN SWIM ANALYSIS — '+str(a['activity_date']),str(a['name']),
-           f'{total:g}m | {len(lengths)} actual pool lengths | swim timer {int(timer//60)}:{int(round(timer%60)):02d} | {pace}',
+           f'{total:g}m | {len(lengths)} actual {pool_m:g}m pool lengths | swim timer {int(timer//60)}:{int(round(timer%60)):02d} | {pace}',
            'Garmin original FIT length records (not estimated Strava crossings).']
     if counts:
         lines.append(f'Strokes: {sum(counts)} total; {statistics.mean(counts):.1f}/length; range {min(counts)}–{max(counts)}')
@@ -315,7 +316,7 @@ def swim_trends():
     def fmt(v,unit=''):
         return f'{v:.1f}{unit}' if v is not None else 'n/a'
     lines=['SWIM TRENDS — Garmin FIT','Imported pool swims: '+str(len(history))+' (up to 12 most recent)',
-           'LATEST: '+str(latest['date'])+' | '+str(round(latest['distance']))+'m | '+pace_str(latest['pace']),
+           'LATEST: '+str(latest['date'])+' | '+str(round(latest['distance']))+'m | '+str(latest['pool_m'])+'m pool | '+pace_str(latest['pace']),
            'Strokes/length '+fmt(latest['stroke'])+' | SWOLF '+fmt(latest['swolf'])+
            ' | second-half pace change '+fmt(latest['drift'],'%')]
     if len(history)<3:
@@ -325,7 +326,7 @@ def swim_trends():
         older=history[min(4,len(history)):]
         lines.append('RECENT SESSIONS')
         for x in recent:
-            lines.append(str(x['date'])+' '+str(round(x['distance']))+'m | '+pace_str(x['pace'])+' | strokes '+fmt(x['stroke'])+' | SWOLF '+fmt(x['swolf']))
+            lines.append(str(x['date'])+' '+str(round(x['distance']))+'m | '+str(x['pool_m'])+'m pool | '+pace_str(x['pace'])+' | strokes '+fmt(x['stroke'])+' | SWOLF '+fmt(x['swolf']))
         if older:
             # Compare at similar paces and same pool length, to reduce misleading SWOLF comparisons.
             similar=[x for x in older if abs(x['pace']-latest['pace'])/latest['pace']<=0.05 and
@@ -337,13 +338,18 @@ def swim_trends():
                              ' ('+fmt(latest['stroke']-baseline,' strokes')+'). Lower may indicate more distance per stroke at similar pace.')
             else:lines.append('No comparable older swims yet (same pool length, pace ±5%, distance ±25%); avoiding misleading efficiency comparisons.')
         else:lines.append('More history needed for a matched-session baseline.')
+    pool_sizes=sorted(set(x['pool_m'] for x in history))
+    if len(pool_sizes)>1:
+        lines.append('POOL-AWARE INTERPRETATION')
+        lines.append('25m and 50m pool strokes/length and raw SWOLF are NOT directly comparable; longer lengths naturally increase both. Efficiency benchmarks use only matching pool lengths.')
+        lines.append('Pace/100m is shown across pools, but extra turns can affect speed. Do not interpret a cross-pool pace difference as a fitness change.')
     lines.append('COACHING NOTE')
     if latest['drift'] is not None and latest['drift']>5:
         lines.append('Second half >5% slower. Consider even-paced aerobic repeats with generous recovery; assess fatigue, technique and rests before changing intensity.')
     elif latest['drift'] is not None and latest['drift']<-5:
         lines.append('Second half >5% faster. Review pacing: a steadier first half may help on continuous swims.')
     else:lines.append('Pacing looks reasonably consistent by recorded active-length times. Maintain technique and gradually build comparable sessions.')
-    lines.append('These are descriptive trends, not fatigue diagnoses. FIT active-length times exclude rest; pool size, drills and stroke type affect SWOLF.')
+    lines.append('Pool size inferred from FIT length distances (Garmin session pool setting). Descriptive only: active-length times exclude rest; drills and stroke type affect efficiency metrics.')
     return '\n'.join(lines)[:3800]
 
 def garmin_recent():

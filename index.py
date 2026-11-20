@@ -207,7 +207,7 @@ def swim_history(max_swims=12):
         drift=(last_pace-first_pace)/first_pace*100 if first_pace and last_pace else None
         history.append({'id':a['activity_id'],'date':a['activity_date'],'distance':total,'seconds':secs,
                         'pace':secs*100/total,'stroke':stroke_rate,'swolf':swolf,'drift':drift,
-                        'lengths':len(lengths)})
+                        'lengths':len(lengths),'pool_m':round(total/len(lengths),2)})
     return history
 
 def swim_trends():
@@ -234,13 +234,13 @@ def swim_trends():
         if older:
             # Compare at similar paces and same pool length, to reduce misleading SWOLF comparisons.
             similar=[x for x in older if abs(x['pace']-latest['pace'])/latest['pace']<=0.05 and
-                     abs(x['distance']-latest['distance'])/latest['distance']<=0.25 and x['stroke'] is not None]
+                     abs(x['distance']-latest['distance'])/latest['distance']<=0.25 and x['pool_m']==latest['pool_m'] and x['stroke'] is not None]
             if similar and latest['stroke'] is not None:
                 baseline=statistics.median(x['stroke'] for x in similar)
-                lines.append('MATCHED-SESSION BENCHMARK ('+str(len(similar))+' older swim(s), pace within 5%, distance within 25%):')
+                lines.append('MATCHED-SESSION BENCHMARK ('+str(len(similar))+' older swim(s), same pool length, pace within 5%, distance within 25%):')
                 lines.append('Strokes/length '+fmt(latest['stroke'])+' vs baseline '+fmt(baseline)+
                              ' ('+fmt(latest['stroke']-baseline,' strokes')+'). Lower may indicate more distance per stroke at similar pace.')
-            else:lines.append('No comparable older swims yet (pace ±5%, distance ±25%); avoiding misleading efficiency comparisons.')
+            else:lines.append('No comparable older swims yet (same pool length, pace ±5%, distance ±25%); avoiding misleading efficiency comparisons.')
         else:lines.append('More history needed for a matched-session baseline.')
     lines.append('COACHING NOTE')
     if latest['drift'] is not None and latest['drift']>5:

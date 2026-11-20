@@ -260,7 +260,7 @@ def swim_analysis():
         lines.append('First 500m: '+str(pace_per_100(first,500))+' | Last 500m: '+str(pace_per_100(last,500)))
     else:lines.append('First/last 500m comparison withheld due to insufficient or implausible splits.')
     lines.append('Stroke counts, SWOLF and exact turn boundaries require Garmin data.')
-    return '\\n'.join(lines)
+    return '\n'.join(lines)
 
 # Explicit daily overrides are stored separately from the original schedule.
 def workout_override(chat,date):
@@ -453,7 +453,7 @@ def handle(text,chat_id):
         swim=sum((r.get('distance_m') or 0) for r in rows if r['kind']=='swim')
         gym=sum(1 for r in rows if r['kind']=='gym')
         return f'THIS WEEK\nSwim: {swim:,} / ~8,200 m\nGym: {gym} / 2 sessions\n\nBased on activities logged in Athlete OS. Strava activities are included after /sync or the daily scheduled import.'
-    if not text.startswith('/') and re.search(r'\\b(?:can.t swim|cannot swim|pool (?:is )?closed|rather (?:do|go to) (?:the )?gym|switch to (?:the )?gym)\\b',text.lower()):
+    if not text.startswith('/') and re.search(r'\b(?:can.t swim|cannot swim|pool (?:is )?closed|rather (?:do|go to) (?:the )?gym|switch to (?:the )?gym)\b',text.lower()):
         return change_workout(chat_id,['/change','gym','a'],'Swim unavailable; requested gym')
     return natural_recovery(text,chat_id) if not text.startswith('/') else 'Unknown command. Try /help.'
 
